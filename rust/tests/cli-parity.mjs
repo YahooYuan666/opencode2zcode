@@ -86,7 +86,12 @@ const rustModels = modelsOf(rustOut);
 check('两边模型数相同', nodeModels.length === rustModels.length, `Node ${nodeModels.length} vs Rust ${rustModels.length}`);
 check('两边模型集合完全一致', JSON.stringify(nodeModels) === JSON.stringify(rustModels),
   `Node: ${nodeModels.join(',')}\n      Rust: ${rustModels.join(',')}`);
-check('恰好是桌面版那 8 个', rustModels.length === 8, `实际 ${rustModels.length} 个`);
+check('默认只暴露 chat 道的 7 个', rustModels.length === 7, `实际 ${rustModels.length} 个：${rustModels.join(',')}`);
+check(
+  '默认不含 responses 道的 muse-spark（那条道 100% 403）',
+  !rustModels.some((m) => m.startsWith('muse-spark')),
+  `出现了：${rustModels.join(',')}`,
+);
 check('下架模型不得出现', !rustModels.some((m) => m === 'mimo-v2.5-free' || m === 'deepseek-v4-flash-free'),
   `出现了下架模型：${rustModels.join(',')}`);
 
@@ -110,7 +115,7 @@ check('思考档位阶梯非空', Object.keys(rustRules).length > 0);
 console.log('\n[4] 参数与帮助');
 const nodeHelp = run(process.execPath, [NODE_ENTRY, '--help']);
 const rustHelp = run(RUST_EXE, ['--help']);
-for (const flag of ['--install', '--uninstall', '--ensure', '--detect', '--print-config', '--remove-provider']) {
+for (const flag of ['--install', '--uninstall', '--ensure', '--detect', '--print-config', '--remove-provider', '--with-responses']) {
   check(`两版都支持 ${flag}`, nodeHelp.includes(flag) && rustHelp.includes(flag));
 }
 

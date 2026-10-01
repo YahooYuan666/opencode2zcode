@@ -1599,7 +1599,7 @@ async function ensureProxyRunning() {
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const options = { port: null, configPath: null, mode: 'serve' };
+  const options = { port: null, configPath: null, mode: 'serve', withResponses: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--port') {
@@ -1612,6 +1612,8 @@ function parseArgs(argv) {
       options.mode = 'write';
     } else if (arg === '--remove-provider') {
       options.mode = 'remove';
+    } else if (arg === '--with-responses') {
+      options.withResponses = true;
     } else if (arg === '--install') {
       options.mode = 'install';
     } else if (arg === '--uninstall') {
@@ -1642,6 +1644,7 @@ const HELP = `opencode2zcode — 把 OpenCode Zen 匿名免费模型接进 ZCode
   node zen-proxy.mjs --remove-provider   只从 ZCode 配置里摘掉本工具的两个 Provider
   node zen-proxy.mjs --port 41930        指定回环端口
   node zen-proxy.mjs --config <path>     直接指定 provider_config.json 完整路径
+  node zen-proxy.mjs --with-responses    连 responses 道那一组也写进配置（默认不写）
 
 装完就不用再管了：启动 ZCode 时会自动静默拉起代理，不会有任何窗口。
 人类用户直接双击 install-autostart.cmd 即可（它就是 --install 的壳）。
@@ -1755,7 +1758,10 @@ async function main() {
 
   function applyCatalog(currentPort, targetConfigPath) {
     state.chatModels = chatModelEntries(catalog);
-    state.responsesModels = responsesModelEntries(catalog);
+    // responses 道默认不暴露：OpenCode 的 /v1/responses 对外部调用一律 403
+    // （「免费档只允许在 OpenCode 内部使用」），是上游 provider 的限制，伪装请求头
+    // 过不去。写进配置只会让模型选择器里多一个点下去必报错的分组。
+    state.responsesModels = options.withResponses ? responsesModelEntries(catalog) : [];
     state.catalogStatus = catalog.snapshot();
     const existing = readExistingConfig(targetConfigPath);
     const config = buildZcodeConfig({
@@ -1772,7 +1778,7 @@ async function main() {
       existing: readExistingConfig(configPath),
       port,
       chatModels: chatModelEntries(catalog),
-      responsesModels: responsesModelEntries(catalog),
+      responsesModels: options.withResponses ? responsesModelEntries(catalog) : [],
     });
     console.error(`# 目标文件：${configPath}`);
     console.error('# 下面所有 apiKey 已脱敏；此模式不落盘、不起服务。');

@@ -61,8 +61,14 @@ const HELP: &str = "opencode2zcode — 把 OpenCode Zen 匿名免费模型接进
   opencode2zcode --remove-provider   只从 ZCode 配置里摘掉本工具的两个 Provider
   opencode2zcode --port 41930        指定回环端口
   opencode2zcode --config <path>     直接指定 provider_config.json 完整路径
+  opencode2zcode --with-responses    连 responses 道那一组也写进配置（默认不写，见下）
 
 装完就不用再管了：启动 ZCode 时会自动静默拉起代理，不会有任何窗口。
+
+为什么没有 responses 道那一组：OpenCode 的 /v1/responses 通道对外部调用一律
+拒绝（403「免费档只允许在 OpenCode 内部使用」），是上游 provider 的限制，
+伪造请求头过不去。默认只暴露确实能用的 chat 道（7 个模型）。上游哪天放开
+了，加 --with-responses 就能把它加回来。
 
 配置落点按这个顺序决定：
   --config  >  ZCODE_DATA_BASE_DIR 环境变量  >  自动探测  >  旁路文件  >  用户主目录
@@ -89,10 +95,13 @@ struct Options {
     port: Option<u16>,
     config_path: Option<String>,
     mode: Mode,
+    /// 是否把 responses 道那一组也写进配置。默认**否**——那条道现在 100% 调不通，
+    /// 写进去只是让模型选择器里多一个点下去必报错的分组。详见 RESPONSES_LANE_NOTE。
+    with_responses: bool,
 }
 
 fn parse_args() -> Result<Options, String> {
-    let mut options = Options { port: None, config_path: None, mode: Mode::Serve };
+    let mut options = Options { port: None, config_path: None, mode: Mode::Serve, with_responses: false };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -114,6 +123,7 @@ fn parse_args() -> Result<Options, String> {
             "--remove-provider" => options.mode = Mode::Remove,
             "--install" => options.mode = Mode::Install,
             "--uninstall" => options.mode = Mode::Uninstall,
+            "--with-responses" => options.with_responses = true,
             arg if arg == autostart::HOOK_MARKER_ARG || arg == "--ensure" => options.mode = Mode::Ensure,
             "--detect" => options.mode = Mode::Detect,
             "--help" | "-h" => options.mode = Mode::Help,
@@ -125,9 +135,19 @@ fn parse_args() -> Result<Options, String> {
 }
 
 /// 把当前目录暴露的模型同步进 ZCode 配置。
-fn apply_catalog(catalog: &catalog::ModelCatalog, state: &Arc<proxy::State>, port: u16, config_path: &Path) {
+fn apply_catalog(
+    catalog: &catalog::ModelCatalog,
+    state: &Arc<proxy::State>,
+    port: u16,
+    config_path: &Path,
+    with_responses: bool,
+) {
     let chat = zcode::chat_model_entries(catalog);
-    let responses = zcode::responses_model_entries(catalog);
+    let responses = if with_responses {
+        zcode::responses_model_entries(catalog)
+    } else {
+        Vec::new()
+    };
     *state.chat_models.lock().unwrap() = chat.iter().map(|m| m.id.clone()).collect();
     *state.responses_models.lock().unwrap() = responses.iter().map(|m| m.id.clone()).collect();
     *state.catalog_status.lock().unwrap() = serde_json::to_value(catalog.snapshot()).unwrap_or(json!({}));
@@ -218,7 +238,10 @@ fn main() {
             }
         }
     }
-    println!("[zen] 配置目标（{}）：{}", resolved.source.label(), config_path.display());
+    // 走 stderr 不是 stdout：--print-config 承诺 stdout 只有 JSON（「代理日志走
+    // stderr，--print-config 的 JSON 走 stdout，方便重定向」），这行要是也进
+    // stdout，输出就没法直接管道给 jq 之类了。
+    eprintln!("[zen] 配置目标（{}）：{}", resolved.source.label(), config_path.display());
 
     let state = Arc::new(proxy::State::new());
     let mut catalog = catalog::ModelCatalog::new(cache_path);
@@ -256,7 +279,11 @@ fn main() {
 
     if options.mode == Mode::Print {
         let chat = zcode::chat_model_entries(&catalog);
-        let responses = zcode::responses_model_entries(&catalog);
+        let responses = if options.with_responses {
+            zcode::responses_model_entries(&catalog)
+        } else {
+            Vec::new()
+        };
         let existing = zcode::read_existing_config(&config_path);
         let config = zcode::build_zcode_config(existing.as_ref(), requested_port, &chat, &responses);
         eprintln!("# 目标文件：{}", config_path.display());
@@ -281,7 +308,7 @@ fn main() {
     }
 
     if options.mode == Mode::Write {
-        apply_catalog(&catalog, &state, requested_port, &config_path);
+        apply_catalog(&catalog, &state, requested_port, &config_path, options.with_responses);
         println!("已写入 {}", config_path.display());
         println!(
             "chat {} 个模型 / responses {} 个模型",
@@ -292,7 +319,7 @@ fn main() {
     }
 
     let port = bound_port.unwrap_or(requested_port);
-    apply_catalog(&catalog, &state, port, &config_path);
+    apply_catalog(&catalog, &state, port, &config_path, options.with_responses);
     println!("[zen] 已同步 ZCode 配置：{}", config_path.display());
     println!(
         "[zen] chat {} 个 / responses {} 个模型",
@@ -304,12 +331,13 @@ fn main() {
     let refresh_state = Arc::clone(&state);
     let refresh_path = config_path.clone();
     let refresh_base = base.clone();
+    let refresh_with_responses = options.with_responses;
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(CATALOG_REFRESH);
             let mut next = catalog::ModelCatalog::new(None);
             if next.refresh_once(&refresh_base) {
-                apply_catalog(&next, &refresh_state, port, &refresh_path);
+                apply_catalog(&next, &refresh_state, port, &refresh_path, refresh_with_responses);
             }
         }
     });

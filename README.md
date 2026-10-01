@@ -212,6 +212,49 @@ nemotron-3-ultra-free nemotron-3.5-lightning-free  space-bunny-free
 > `mimo-v2.5-free` 和 `muse-spark-1.2-contributor-free`（两个都已下架）。
 > `selftest.mjs` 里有针对这一条的回归测试。
 
+### 为什么默认只有 7 个，目录里却是 8 个
+
+第 8 个是 `muse-spark-1.3-contributor-free`，它只挂在 OpenCode 的 `/v1/responses`
+通道上。而**那条通道对匿名调用一律拒绝**：
+
+```
+403  OpenCode's free tier can only be used from within OpenCode
+```
+
+**这不是伪装请求头能过的门禁，是「额度归属」问题。** 对照 OpenCode 自己的模型
+清单（`packages/console/app/src/component/go-models.ts`）看得很清楚：
+
+| 模型 | 额度 | 地区限制 | 匿名（`public`）能用吗 |
+| --- | --- | --- | --- |
+| `space-bunny-free` | `Infinity` | 否 | ✅ 能 |
+| `longcat-2.5-preview-free` | `Infinity` | 否 | ✅ 能 |
+| `muse-spark-1.3-contributor` | 45300 / 5 小时 | 是 | ❌ 不能 |
+
+**能匿名用的那几个是无限额的；muse-spark 是给登录用户用的计量额度。** 上游推理
+服务（错误信息前缀 `Error from provider (Console)`）认的是 OpenCode 自己那把真实
+API key——`packages/console/app/src/routes/zen/util/handler.ts` 在转发给 provider
+时会 `headers.set` 上 `x-zen-model` 和 `x-zen-billing-source`，并注入真实凭据。
+`public` 换来的 `authInfo` 是空的，`billingSource` 落到 `anonymous`，于是被拒。
+
+2026-10 逐项试过，都不是协议细节问题：
+
+| 尝试 | 结果 |
+| --- | --- |
+| 补 `bash` / `read` 门禁工具（chat 道靠它过门禁） | 无效 |
+| 换 Responses API 的扁平工具格式 | 无效 |
+| 补 `x-zen-model` / `x-zen-billing-source` 头 | 无效 |
+| 去掉 `-free` 后缀用 `muse-spark-1.3-contributor` | `Model is not supported` |
+| 把 muse-spark 放到 chat 道试 | 500（该模型不在这一道） |
+
+**上游的 `opencode2pi-desktop` 有同样的限制，原因完全一样**——它也拿不到登录凭据。
+
+所以默认**不把这一组写进配置**：写进去只是让模型选择器里多一个点下去必报错的
+分组。上游哪天放开了，`--with-responses` 就能加回来。
+
+> **唯一能真正用上 muse-spark 的办法**：拿你自己 OpenCode 账号的 Zen key 代替
+> `public`。那样 `authInfo` 有值、额度记在你账上，它就是可用的。本工具刻意不这么做
+> ——它的定位是「不碰任何账号的匿名通道」，一旦要用户交出真实凭据，它就不是那个东西了。
+
 ### 评分能不能显示在 ZCode 里
 
 **数据拿得到，但显示不了——卡在 ZCode 那边，不是卡在本工具。**
@@ -268,32 +311,30 @@ ZCode 个人配置有两条模型元数据车道：`providerModelRules`（smart�
 ```
 GET  /healthz                              -> 200，目录 source=live，84 个模型，暴露 9 个
 GET  /v1/models                            -> 7 个 chat 模型
-POST /v1/chat/completions  big-pickle      -> 200，SSE 流式正常返回
+POST /v1/chat/completions  big-pickle      -> 200，SSE 流式正常返回，模型回了 "OK"
      同上，带 reasoning_effort:"none"       -> 200（档位被摘掉，不再 400）
      同上，带 reasoning_effort:"high"       -> 200（原样透传）
-POST /v1/responses  muse-spark-1.3-...     -> 上游 RegionError（见下）
+POST /v1/responses  任意模型                 -> 501 + 诊断（这条道上游对外部一律 403）
 POST 不存在的模型                            -> 上游 ModelError + 401，原样透传
 非回环 Host 访问 /healthz                    -> 403 loopback requests only
-node selftest.mjs                          -> 22/22 通过（本地 mock，不打真实网络）
+
+cargo test                        25/25
+node rust/tests/cli-parity.mjs    18/18   Node 版 vs Rust 版，配置逐字节一致
+node rust/tests/live-mock.mjs     21/21   端到端打本地 mock
+node selftest.mjs                 24/24   Node 版回归
 ```
 
-配置里实际是 **8 个模型**：`opencode-free` 7 个（chat 道）+ `opencode-free-responses`
-1 个（`muse-spark-1.3-contributor-free`，responses 道）。`/healthz` 里的
-`exposed: 9` 比这个多 1，是因为统计的是分道**之前**的清单——多出来那个是
-`jev-*` 系列的模型，它两条道都不走（只答 `/systemone`），本来就不该进配置。
+配置里实际是 **7 个模型**，都在 `opencode-free`（chat 道）。`/healthz` 里的
+`exposed: 9` 比这个多 2：一个是 `muse-spark-1.3-contributor-free`（只挂 responses 道，
+而那条道调不通，见下），另一个是 `jev-*` 系列（两条道都不走，只答 `/systemone`）。
 
-**两条限制，都不是本工具的 bug：**
+**已知限制，都不是本工具的 bug：**
 
-1. **Muse Spark 系列有地区限制。** `muse-spark-1.3-contributor-free` 从本机请求返回
-   `RegionError: This model is not available in your country.`
-   所以 `opencode-free-responses` 这一组在本机点了会报错。不需要就把它从配置里删掉。
-2. **匿名通道按 IP 限速。** 429 会原样呈现。这是 OpenCode 提供的免费入口，
-   且上游会检查「是不是从 OpenCode 里发出来的」——本工具靠伪装头 + 体门禁通过该检查，
-   属于客户端伪装，**上游随时可能收紧导致失效**，原项目自己也写明「不保证可用性」。
-
-> 另有一个已修的历史问题：`deepseek-v4-flash-free` 曾经出现在清单里，但它在
-> 目录里标着 `status: deprecated`，上游返回 400 `Model is unavailable`。
-> 现在的规则会把它剔掉。
+1. **匿名通道按 IP 限速。** 429 会原样呈现，等一会儿就好。
+2. **本质是客户端伪装，上游随时可能收紧。** 免费通道只允许在 OpenCode 内部使用，
+   本工具靠伪装请求头 + 体门禁混过去。**没盗用任何账号或密钥，但确实是在冒充身份**
+   过一道对方明确设了限制的关卡。原项目自己也写明「不保证可用性」。
+3. **`responses` 道调不通**（见上一节），所以默认不暴露 muse-spark。
 
 ---
 
@@ -306,6 +347,7 @@ node selftest.mjs                          -> 22/22 通过（本地 mock，不�
 | 模型列表比预期少 | 看 `/healthz` 的 `catalog.status`：`static` 表示还没联网成功，用的是内置兜底清单；`lastError` 会写原因。目录里判定为「已下架」的模型会被有意剔掉 |
 | 对话报 403 `FreeTierError` | 伪装头或体门禁没过，上游收紧了。`x-opencode-client` / `user-agent` 的版本号可能要跟着官方 CLI 更新 |
 | 对话报 429 | 匿名通道按 IP 限速，等一会儿 |
+| 请求 `/v1/responses` 报 501 | 这是预期行为，见「为什么默认只有 7 个」那一节 |
 | 对话报 400 `invalid request` | 看代理 stderr 有没有「摘掉该字段重试」的日志；若重试也 400，多半是这个模型当前不可用 |
 | 想撤销 | 双击 `uninstall.cmd`（钩子和 Provider 一起清干净）。只想清 Provider 就 `node zen-proxy.mjs --remove-provider`；只想停自启就 `node zen-proxy.mjs --uninstall` |
 

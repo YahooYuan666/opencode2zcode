@@ -121,8 +121,12 @@ try {
     (r) => r.providerId === 'opencode-free-responses',
   );
   check('付费模型不进清单', !chat.config.personalModelIds.includes('paid-model-x'));
-  check('muse-spark 走 responses 道', !chat.config.personalModelIds.includes('muse-spark-1.3-contributor-free')
-    && responses.config.personalModelIds.includes('muse-spark-1.3-contributor-free'));
+  check(
+    '默认不暴露 responses 道（上游对外部调用一律 403）',
+    responses === undefined,
+    `不该有 ${responses?.providerId} 这一组`,
+  );
+  check('chat 道不含 muse-spark', !chat.config.personalModelIds.includes('muse-spark-1.3-contributor-free'));
   check('下架模型被剔除', !chat.config.personalModelIds.includes('mimo-v2.5-free'),
     `实际：${chat.config.personalModelIds.join(',')}`);
 

@@ -150,15 +150,31 @@ async function main() {
       assert.ok(chat.includes('big-pickle'), 'big-pickle 应在 chat 清单里');
       assert.ok(chat.includes('space-bunny-free'), 'space-bunny-free 应在 chat 清单里');
     });
-    test('muse-spark 走 responses 道，不混进 chat', () => {
+    test('默认不写 responses 组（上游对外部调用一律 403）', () => {
+      assert.equal(responses.length, 0, `默认不该有 responses 组，实际有 ${responses.join(',')}`);
+    });
+    test('chat 道不含 muse-spark（它只挂在 responses 道）', () => {
       assert.ok(!chat.includes('muse-spark-1.3-contributor-free'), 'muse-spark 不该在 chat 道');
-      assert.ok(responses.includes('muse-spark-1.3-contributor-free'), 'muse-spark 应在 responses 道');
+    });
+    test('开 --with-responses 才把 muse-spark 加回来', async () => {
+      const optInConfig = path.join(workDir, 'optin.json');
+      fs.writeFileSync(optInConfig, JSON.stringify({ schemaVersion: 1, config: {} }, null, 2));
+      const result = await runProxy(
+        ['--write-config-only', '--config', optInConfig, '--with-responses'],
+        baseEnv,
+      );
+      assert.equal(result.code, 0, `退出码应为 0，实际 ${result.code}`);
+      const optIn = readConfig(optInConfig);
+      const rules = optIn.config.providerConfigRules.providerRules;
+      const responsesRule = rules.find((r) => r.providerId === 'opencode-free-responses');
+      assert.ok(responsesRule, '开开关后应有 responses 组');
+      assert.ok(
+        responsesRule.config.personalModelIds.includes('muse-spark-1.3-contributor-free'),
+        'muse-spark 应在 responses 道',
+      );
     });
     test('目录判定废弃的模型被剔除（回归：mimo-v2.5-free 曾被误放进来）', () => {
-      assert.ok(
-        !chat.includes('mimo-v2.5-free') && !responses.includes('mimo-v2.5-free'),
-        'mimo-v2.5-free 已下架，不该出现在任何一道',
-      );
+      assert.ok(!chat.includes('mimo-v2.5-free'), 'mimo-v2.5-free 已下架，不该出现');
     });
     test('S3 静态兜底不会复活废弃模型', () => {
       // 静态清单里若残留废弃 id，decision() 也必须否决它。

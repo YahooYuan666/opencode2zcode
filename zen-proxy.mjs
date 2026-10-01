@@ -1,0 +1,1417 @@
+#!/usr/bin/env node
+/**
+ * opencode2zcode — 把 OpenCode Zen 的匿名免费模型接进 ZCode。
+ *
+ * 移植自 JasonYu0822/opencode2pi-desktop 的 lib/zen.js + main.js（MIT）。
+ * 那边的伪装细节又来自 FishBottle7/opencode2dsh 与 jasonxu114514/opencode2api。
+ * 这里保留的是：CLI 一致的伪装头、规范形状的 ses_ 会话 id、免费通道体门禁、
+ * reasoning_effort 归一、S1∩S2 模型目录、SSE 逐块透传、磁盘目录缓存。
+ * 有意不移植：IP 池 / 代理轮换子系统、Go sidecar。
+ *
+ * 为什么不能用 ZCode 插件做：
+ *   ZCode 的 .zcode-plugin/plugin.json 只能贡献 skills / commands / hooks /
+ *   mcpServers，既没有 pi-desktop 的 contributes.providers（宿主静态声明
+ *   provider），也没有 contributes.services（常驻回环服务）。所以这里改成
+ *   ZCode 官方支持的那条路：本进程跑回环代理，并把 provider 声明写进 ZCode 的
+ *   「个人 Provider 配置」{~}/.zcode/v2/provider_config.json。ZCode 对该文件
+ *   每 1 秒轮询一次，改完热生效，不用重启。
+ *
+ * 用法：
+ *   node zen-proxy.mjs                 # 起代理 + 写配置
+ *   node zen-proxy.mjs --print-config  # 只打印将要写入的配置，不落盘不起服务
+ *   node zen-proxy.mjs --write-config-only
+ *   node zen-proxy.mjs --port 41930 --config <path>
+ */
+
+import { createHash, randomBytes } from 'node:crypto';
+import { createServer } from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { Readable } from 'node:stream';
+import { fileURLToPath } from 'node:url';
+
+/** 本脚本所在目录；旁路文件与配置都相对它定位。 */
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+// ---------------------------------------------------------------------------
+// 常量
+// ---------------------------------------------------------------------------
+
+/** 上游根地址；可用 ZEN_BASE_URL 覆盖（指向自建网关或本地 mock 便于自测）。 */
+const ZEN_BASE_URL = (process.env.ZEN_BASE_URL?.trim() || 'https://opencode.ai/zen').replace(
+  /\/+$/,
+  '',
+);
+const METADATA_URL = 'https://models.dev/api.json';
+
+/** 匿名通道的固定 Bearer，不是密钥，PI-Desktop 那边也一样写死。 */
+const ANONYMOUS_KEY = 'public';
+
+/** 伪装成哪个版本的官方 CLI。上游若收紧，改这里。 */
+const OPENCODE_CLIENT_VERSION = '1.18.31';
+
+const DEFAULT_PORT = 41930;
+const PORT_CANDIDATES = [DEFAULT_PORT, 41931, 41932, 41933];
+
+const CATALOG_TIMEOUT_MS = 30_000;
+const CATALOG_REFRESH_MS = 300_000;
+const CATALOG_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const UPSTREAM_HEADER_TIMEOUT_MS = 60_000;
+
+/** 上游因 body 不合规拒绝时的状态码；命中则摘掉 reasoning_effort 重试一次。 */
+const RETRY_WITHOUT_EFFORT_STATUSES = [400, 422, 500];
+
+const PROVIDER_ID = 'opencode-free';
+const PROVIDER_NAME = 'OpenCode 免费模型';
+const RESPONSES_PROVIDER_ID = 'opencode-free-responses';
+const RESPONSES_PROVIDER_NAME = 'OpenCode 免费模型 · Responses';
+
+const CACHE_FILE_NAME = 'opencode2zcode-catalog.json';
+
+/**
+ * S3 兜底：实测可用的免费 id（取自 opencode2pi-desktop，2026-09）。
+ * 离线首启、目录还没拉到时用这份，保证 provider 声明不是空的。
+ */
+const STATIC_FREE_MODELS = [
+  'big-pickle',
+  'ling-3.0-flash-fin-free',
+  'longcat-2.5-preview-free',
+  'mimo-v2.5-free',
+  'mimo-v2.6-flash-free',
+  'muse-spark-1.2-contributor-free',
+  'muse-spark-1.3-contributor-free',
+  'nemotron-3-ultra-free',
+  'nemotron-3.5-lightning-free',
+  'space-bunny-free',
+];
+
+const CHAT_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high'];
+const SPACE_BUNNY_THINKING_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const MUSE_THINKING_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
+
+/** 首启引导用的静态元数据（models.dev 实测值，2026-09）。 */
+const BOOTSTRAP_MODELS = [
+  { id: 'big-pickle', contextWindow: 200000, maxTokens: 32000, supportsImages: false, thinkingLevels: CHAT_THINKING_LEVELS },
+  { id: 'ling-3.0-flash-fin-free', contextWindow: 262144, maxTokens: 32768, supportsImages: false, thinkingLevels: CHAT_THINKING_LEVELS },
+  { id: 'longcat-2.5-preview-free', contextWindow: 1000000, maxTokens: 131072, supportsImages: true, thinkingLevels: CHAT_THINKING_LEVELS },
+  { id: 'mimo-v2.5-free', contextWindow: 200000, maxTokens: 32000, supportsImages: true, thinkingLevels: CHAT_THINKING_LEVELS },
+  { id: 'mimo-v2.6-flash-free', contextWindow: 200000, maxTokens: 32000, supportsImages: true, thinkingLevels: CHAT_THINKING_LEVELS },
+  { id: 'nemotron-3-ultra-free', contextWindow: 1000000, maxTokens: 128000, supportsImages: false, thinkingLevels: CHAT_THINKING_LEVELS },
+  { id: 'nemotron-3.5-lightning-free', contextWindow: 262144, maxTokens: 262144, supportsImages: false, thinkingLevels: CHAT_THINKING_LEVELS },
+  { id: 'space-bunny-free', contextWindow: 1048576, maxTokens: 524288, supportsImages: true, thinkingLevels: SPACE_BUNNY_THINKING_LEVELS },
+];
+
+const BOOTSTRAP_RESPONSES_MODELS = [
+  { id: 'muse-spark-1.2-contributor-free', contextWindow: 1048576, maxTokens: 131072, supportsImages: true, thinkingLevels: MUSE_THINKING_LEVELS },
+  { id: 'muse-spark-1.3-contributor-free', contextWindow: 1048576, maxTokens: 131072, supportsImages: true, thinkingLevels: MUSE_THINKING_LEVELS },
+];
+
+// ---------------------------------------------------------------------------
+// 关联 id + 伪装头（对应 ids.ts）
+// ---------------------------------------------------------------------------
+
+const CANONICAL_SESSION_PATTERN = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+const BASE62_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+function base62Fixed(value, width) {
+  const base = 62n;
+  let n = value;
+  const out = new Array(width);
+  for (let i = width - 1; i >= 0; i -= 1) {
+    out[i] = BASE62_ALPHABET.charAt(Number(n % base));
+    n /= base;
+  }
+  return out.join('');
+}
+
+/** sha256("prefix\0value") 取前 12 字节，稳定且不可逆。 */
+function stableID(prefix, value) {
+  const sum = createHash('sha256').update(`${prefix}\x00${value}`).digest();
+  return `${prefix}_${sum.subarray(0, 12).toString('hex')}`;
+}
+
+function randomID(prefix, size) {
+  return `${prefix}_${randomBytes(size).toString('hex')}`;
+}
+
+/** 会话信号 = 第一条 user 消息内容的 JSON，同一对话恒定。 */
+function conversationSeed(messages) {
+  for (const message of messages || []) {
+    if (!message || message.role !== 'user') continue;
+    const encoded = JSON.stringify(message.content ?? null);
+    if (encoded !== 'null' && encoded.length > 0) return encoded;
+  }
+  return '';
+}
+
+/** 免费通道只认 ses_+12hex+14base62 的形状，别的都确定性哈希进去。 */
+function canonicalSessionID(signal) {
+  if (CANONICAL_SESSION_PATTERN.test(signal)) return signal;
+  const sum = createHash('sha256').update(`ses\x00${signal}`).digest();
+  const timePart = sum.subarray(0, 6).toString('hex');
+  const randomPart = base62Fixed(BigInt(`0x${sum.subarray(6, 16).toString('hex')}`), 14);
+  return `ses_${timePart}${randomPart}`;
+}
+
+function deriveRequestIDs(messages) {
+  let signal = conversationSeed(messages);
+  if (signal === '' || signal === '{}') signal = randomID('fallback', 16);
+  return {
+    session: canonicalSessionID(signal),
+    request: randomID('req', 16),
+    project: stableID('prj', 'opencode2zcode:default-project'),
+  };
+}
+
+function opencodeUserAgent() {
+  return `opencode/${OPENCODE_CLIENT_VERSION} (${process.platform} ${process.arch}; node${process.versions.node})`;
+}
+
+/** 每次上游请求都带的完整伪装头。 */
+function disguiseHeaders(ids) {
+  return {
+    'user-agent': opencodeUserAgent(),
+    'x-opencode-client': 'cli',
+    'x-opencode-session': ids.session,
+    'x-session-affinity': ids.session,
+    'X-Session-Id': ids.session,
+    'x-opencode-request': ids.request,
+    'x-opencode-project': ids.project,
+  };
+}
+
+/**
+ * chat 与 responses 两种线格式都归一到同一份关联 id：
+ * chat 看 messages，responses 看 input（字符串或 item 数组）。
+ */
+function deriveRequestIDsFromWire(body) {
+  if (body && Array.isArray(body.messages)) return deriveRequestIDs(body.messages);
+  const input = body && body.input;
+  if (typeof input === 'string') return deriveRequestIDs([{ role: 'user', content: input }]);
+  if (Array.isArray(input)) {
+    const messages = input
+      .map((item) => {
+        if (typeof item === 'string') return { role: 'user', content: item };
+        if (!item || typeof item !== 'object') return null;
+        const role = item.role === 'assistant' ? 'assistant' : 'user';
+        const content =
+          typeof item.content === 'string'
+            ? item.content
+            : Array.isArray(item.content)
+              ? item.content.map((part) => (part && typeof part.text === 'string' ? part.text : '')).join('')
+              : typeof item.text === 'string'
+                ? item.text
+                : '';
+        return { role, content };
+      })
+      .filter(Boolean);
+    return deriveRequestIDs(messages);
+  }
+  return deriveRequestIDs([]);
+}
+
+// ---------------------------------------------------------------------------
+// 免费通道体门禁（对应 messages.ts）
+// ---------------------------------------------------------------------------
+
+/** 实测：匿名通道对不流式、或缺 bash/read 函数工具的 chat 请求直接 403。 */
+const FREE_LANE_GATE_TOOL_NAMES = ['bash', 'read'];
+
+function freeLaneGateTool(name) {
+  return {
+    type: 'function',
+    function: {
+      name,
+      description: 'Reserved for the host runtime; do not call it.',
+      parameters: { type: 'object', properties: {} },
+    },
+  };
+}
+
+/**
+ * 补齐缺失的门禁工具。原本一个工具都没有时补 tool_choice:"none"，
+ * 免得模型真的去调这两个占位桩；宿主自带工具时不动它的 tool_choice。
+ */
+function ensureFreeLaneShape(body) {
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  const names = new Set(tools.map((tool) => (tool && tool.function && tool.function.name) || undefined));
+  const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !names.has(name));
+  if (missing.length === 0) return body;
+  const next = { ...body };
+  next.tools = [...tools, ...missing.map(freeLaneGateTool)];
+  if (tools.length === 0) next.tool_choice = 'none';
+  return next;
+}
+
+// ---------------------------------------------------------------------------
+// 思考档位归一
+// ---------------------------------------------------------------------------
+
+/** 上游确实会接受的「主动思考」档位。off/none 不在其中，见下。 */
+const ACCEPTED_EFFORT_LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const DEFAULT_EFFORT_LADDER = ['minimal', 'low', 'medium', 'high'];
+
+/**
+ * 实测（2026-10，逐模型探测）上游的档位并不统一：
+ *   big-pickle      off/none=400，minimal…max=200
+ *   space-bunny     off/none=400，minimal/high/max=200
+ *   nemotron-3.5    off=400，none/minimal/high/max=200
+ *   mimo-v2.5       off=500，none/high=200（minimal/max 时好时坏，上游抖动）
+ * 原项目当时把 off/缺失/未知一律写成 "none"，今天这样会直接把请求打成 400，
+ * 所以这里改成：只透传上游确实认的主动档位；off / none / 缺失 / 未知一律
+ * **省略该字段**，退回厂商默认（这些免费模型基本都是 always-think，
+ * 本来也没有可靠的办法真正关掉思考）。handleUpstream 里还有一次摘字段重试兜底。
+ */
+function upstreamEffort(hostValue) {
+  if (hostValue === undefined || hostValue === null || hostValue === '') return undefined;
+  return ACCEPTED_EFFORT_LADDER.includes(hostValue) ? hostValue : undefined;
+}
+
+/** 从 models.dev 的 reasoning_options 推出 UI 档位阶梯（去掉上游不收的 off/none）。 */
+function effortsFor(capability) {
+  if (!capability || !capability.reasoning) return [];
+  const declared = [];
+  for (const value of capability.effortValues || []) {
+    const level = value === 'none' ? 'off' : value;
+    if (ACCEPTED_EFFORT_LADDER.includes(level) && !declared.includes(level)) declared.push(level);
+  }
+  if (declared.length === 0) return DEFAULT_EFFORT_LADDER.slice();
+  return declared.sort(
+    (a, b) => ACCEPTED_EFFORT_LADDER.indexOf(a) - ACCEPTED_EFFORT_LADDER.indexOf(b),
+  );
+}
+
+/**
+ * 把宿主发来的 chat 体整理成免费通道能收的形状：强制流式、透传受支持的思考
+ * 档位（否则不带这个字段）、再套门禁。其余原样转发。
+ */
+function buildUpstreamBody(hostBody) {
+  const source = hostBody && typeof hostBody === 'object' ? hostBody : {};
+  const body = { ...source, stream: true };
+  const effort = upstreamEffort(source.reasoning_effort);
+  if (effort === undefined) {
+    delete body.reasoning_effort;
+  } else {
+    body.reasoning_effort = effort;
+  }
+  return ensureFreeLaneShape(body);
+}
+
+// ---------------------------------------------------------------------------
+// 模型目录（对应 catalog.ts）
+// ---------------------------------------------------------------------------
+
+function isFreeModel(model) {
+  return String(model).toLowerCase().includes('free');
+}
+
+function metadataDeprecated(model) {
+  if (model.deprecated === true) return true;
+  const status = String(model.status ?? model.lifecycle ?? '').toLowerCase();
+  if (status === 'deprecated' || status === 'retired' || status === 'disabled') return true;
+  return model.deprecated_at != null || model.retirement_date != null;
+}
+
+function decodeEffortValues(raw) {
+  if (!Array.isArray(raw)) return { effortValues: [] };
+  const values = [];
+  for (const option of raw) {
+    if (!option || typeof option !== 'object') continue;
+    if (option.type !== 'effort' || !Array.isArray(option.values)) continue;
+    for (const value of option.values) {
+      if (typeof value === 'string' && value.length > 0 && !values.includes(value)) values.push(value);
+    }
+  }
+  return { effortValues: values };
+}
+
+/** models.dev 的 OpenCode 段 → Map(modelId → 元数据)。 */
+function decodeModelsDev(data) {
+  const result = new Map();
+  if (!data || typeof data !== 'object') return result;
+  const rank = (key) => {
+    const lower = key.toLowerCase();
+    if (lower === 'opencode' || lower === 'opencode-zen' || lower === 'opencode_zen') return 0;
+    if (lower.includes('opencode')) return 1;
+    return 2;
+  };
+  const keys = Object.keys(data).sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+  for (const key of keys) {
+    if (rank(key) > 1) continue;
+    const provider = data[key];
+    if (!provider || typeof provider !== 'object') continue;
+    if (rank(key) === 1) {
+      const identity = `${provider.id ?? ''} ${provider.name ?? ''}`.toLowerCase().trim();
+      if (!identity.includes('opencode')) continue;
+    }
+    const models = provider.models;
+    if (!models || typeof models !== 'object') continue;
+    for (const [modelKey, raw] of Object.entries(models)) {
+      if (!raw || typeof raw !== 'object') continue;
+      const modelId = typeof raw.id === 'string' && raw.id.length > 0 ? raw.id : modelKey;
+      const cost = raw.cost ?? {};
+      const limit = raw.limit ?? {};
+      const num = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : undefined);
+      result.set(modelId, {
+        input: num(cost.input),
+        output: num(cost.output),
+        deprecated: metadataDeprecated(raw),
+        reasoning: raw.reasoning === true,
+        contextWindow: num(limit && limit.context) ?? 262144,
+        maxTokens: num(limit && limit.output) ?? 32768,
+        modalitiesInput: Array.isArray(raw.modalities && raw.modalities.input)
+          ? raw.modalities.input.map(String)
+          : [],
+        ...decodeEffortValues(raw.reasoning_options),
+      });
+    }
+    if (result.size > 0) return result;
+  }
+  return result;
+}
+
+/** 是否免费：元数据优先（成本 0/0 且未废弃），元数据没就绪时看名字。 */
+function decide(model, prices, ready) {
+  const nameFree = isFreeModel(model);
+  const fallback = (source) =>
+    nameFree ? { allowed: true, source: 'name_free', known: false } : { allowed: false, source, known: false };
+  if (!ready || prices.size === 0) return fallback('metadata_pending');
+  const price = prices.get(model);
+  if (!price) return fallback('metadata_model_missing');
+  if (price.deprecated) return { allowed: false, source: 'metadata_deprecated', known: true };
+  if (price.input === 0 && price.output === 0) {
+    return { allowed: true, source: nameFree ? 'name_and_metadata_free' : 'metadata_free', known: true };
+  }
+  if (price.input === undefined || price.output === undefined) {
+    return { allowed: false, source: 'metadata_cost_unknown', known: false };
+  }
+  return { allowed: false, source: 'metadata_paid', known: true };
+}
+
+async function withTimeout(promise, ms, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** S1：带伪装头拉 Zen 的实时目录。 */
+async function fetchZenModels(fetchImpl) {
+  const response = await withTimeout(
+    fetchImpl(`${ZEN_BASE_URL}/v1/models`, {
+      headers: {
+        authorization: `Bearer ${ANONYMOUS_KEY}`,
+        'user-agent': opencodeUserAgent(),
+        'x-opencode-client': 'cli',
+        accept: 'application/json',
+      },
+    }),
+    CATALOG_TIMEOUT_MS,
+    'models catalog fetch',
+  );
+  if (!response.ok) throw new Error(`models endpoint returned HTTP ${response.status}`);
+  const payload = await response.json();
+  const models = [];
+  for (const item of payload && payload.data ? payload.data : []) {
+    if (item && typeof item.id === 'string' && item.id.length > 0) models.push(item.id);
+  }
+  if (models.length === 0) throw new Error('models endpoint returned an empty list');
+  return models;
+}
+
+class ModelCatalog {
+  #fetchImpl;
+  #onChange;
+  #cachePath;
+  #cacheState = null;
+  #cacheSeeded = false;
+  #liveAt = 0;
+  #changeKey = '';
+  #zen = new Set();
+  #updatedAt = 0;
+  #prices = new Map();
+  #pricesReady = false;
+  #lastError = '';
+  #timer = null;
+  #stopped = false;
+  #refreshing = false;
+
+  constructor(fetchImpl, onChange, options = {}) {
+    this.#fetchImpl = fetchImpl;
+    this.#onChange = typeof onChange === 'function' ? onChange : null;
+    this.#cachePath = typeof options.cachePath === 'string' && options.cachePath.length > 0 ? options.cachePath : null;
+  }
+
+  /** 先读盘播种，离线启动也能保住上次的真实清单，不退化成静态兜底。 */
+  #seedFromCache() {
+    if (this.#cacheSeeded) return;
+    this.#cacheSeeded = true;
+    if (!this.#cachePath) return;
+    let raw = null;
+    try {
+      raw = JSON.parse(fs.readFileSync(this.#cachePath, 'utf8'));
+    } catch {
+      return;
+    }
+    if (!raw || raw.version !== 1) return;
+    if (!Number.isFinite(raw.updatedAt) || Date.now() - raw.updatedAt > CATALOG_CACHE_TTL_MS) return;
+    const ids = Array.isArray(raw.zen) ? raw.zen.filter((id) => typeof id === 'string' && id.length > 0) : [];
+    const prices = Array.isArray(raw.prices) ? new Map(raw.prices) : new Map();
+    if (ids.length === 0 && prices.size === 0) return;
+    if (ids.length > 0) {
+      this.#zen = new Set(ids);
+      this.#updatedAt = raw.updatedAt;
+    }
+    if (prices.size > 0) {
+      this.#prices = prices;
+      this.#pricesReady = true;
+    }
+    this.#cacheState = { fingerprint: this.#cacheFingerprint() };
+  }
+
+  #cachePayload() {
+    const sortPairs = (pairs) => [...pairs].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    return { zen: [...this.#zen].sort(), prices: sortPairs(this.#prices.entries()) };
+  }
+
+  #cacheFingerprint() {
+    const payload = this.#cachePayload();
+    return JSON.stringify([payload.zen, payload.prices]);
+  }
+
+  /** 只有数据真的变了才落盘，避免每 5 分钟白写一次。 */
+  #saveCache() {
+    if (!this.#cachePath) return;
+    if (this.#zen.size === 0 && this.#prices.size === 0) return;
+    const fingerprint = this.#cacheFingerprint();
+    if (this.#cacheState && this.#cacheState.fingerprint === fingerprint) return;
+    try {
+      const payload = { version: 1, updatedAt: Date.now(), ...this.#cachePayload() };
+      const temporary = `${this.#cachePath}.${process.pid}.tmp`;
+      fs.writeFileSync(temporary, JSON.stringify(payload), 'utf8');
+      fs.renameSync(temporary, this.#cachePath);
+      this.#cacheState = { fingerprint };
+    } catch {
+      // 缓存写不进去不是致命问题，实时目录照常工作。
+    }
+  }
+
+  async start() {
+    this.#stopped = false;
+    await this.refreshOnce();
+    let attempts = 0;
+    while (this.#zen.size === 0 && attempts < 4 && !this.#stopped) {
+      attempts += 1;
+      await new Promise((resolve) => setTimeout(resolve, 15_000));
+      if (this.#stopped) return;
+      await this.refreshOnce();
+    }
+    if (this.#stopped) return;
+    this.#timer = setInterval(() => void this.refreshOnce(), CATALOG_REFRESH_MS);
+    if (this.#timer.unref) this.#timer.unref();
+  }
+
+  stop() {
+    this.#stopped = true;
+    if (this.#timer) {
+      clearInterval(this.#timer);
+      this.#timer = null;
+    }
+  }
+
+  async refreshOnce() {
+    if (this.#refreshing) return;
+    this.#refreshing = true;
+    try {
+      this.#seedFromCache();
+      await Promise.allSettled([this.#refreshZen(), this.#refreshMetadata()]);
+      this.#saveCache();
+      // 只在暴露清单真的变了时回调一次，重复刷新保持安静。
+      const key = this.list().join('|');
+      if (key !== this.#changeKey) {
+        const first = this.#changeKey === '';
+        this.#changeKey = key;
+        if (!first && this.#onChange) {
+          try {
+            this.#onChange();
+          } catch {
+            /* 回调绝不能弄坏刷新 */
+          }
+        }
+      }
+    } finally {
+      this.#refreshing = false;
+    }
+  }
+
+  async #refreshZen() {
+    try {
+      const ids = await fetchZenModels(this.#fetchImpl);
+      this.#zen = new Set(ids);
+      this.#updatedAt = Date.now();
+      this.#liveAt = this.#updatedAt;
+      this.#lastError = '';
+    } catch (err) {
+      this.#lastError = err && err.message ? err.message : String(err);
+    }
+  }
+
+  async #refreshMetadata() {
+    try {
+      const response = await withTimeout(
+        this.#fetchImpl(METADATA_URL, { headers: { accept: 'application/json' } }),
+        CATALOG_TIMEOUT_MS,
+        'models.dev fetch',
+      );
+      if (!response.ok) throw new Error(`models.dev returned HTTP ${response.status}`);
+      const prices = decodeModelsDev(await response.json());
+      if (prices.size === 0) throw new Error('models.dev contains no OpenCode model metadata');
+      this.#prices = prices;
+      this.#pricesReady = true;
+      this.#liveAt = Date.now();
+    } catch (err) {
+      if (!this.#pricesReady) this.#lastError = err && err.message ? err.message : String(err);
+    }
+  }
+
+  decision(model) {
+    const metadata = decide(model, this.#prices, this.#pricesReady);
+    // S3 兜底：编译期实测过的 id，在元数据未就绪/缺失/陈旧废弃时继续暴露。
+    if (
+      !metadata.allowed &&
+      (!metadata.known || metadata.source === 'metadata_deprecated') &&
+      STATIC_FREE_MODELS.includes(model)
+    ) {
+      return { allowed: true, source: 'static_verified', known: false };
+    }
+    return metadata;
+  }
+
+  /** 暴露的 id：S1 ∩ 允许；S1 还没到时用静态实测清单。 */
+  list() {
+    if (this.#zen.size === 0) return STATIC_FREE_MODELS.slice().sort();
+    const out = [];
+    for (const model of this.#zen) {
+      if (this.decision(model).allowed) out.push(model);
+    }
+    return out.sort();
+  }
+
+  reasoningCapability(model) {
+    const price = this.#prices.get(model);
+    if (!price) return undefined;
+    return { reasoning: price.reasoning === true, effortValues: price.effortValues ?? [] };
+  }
+
+  metadata(model) {
+    return this.#prices.get(model);
+  }
+
+  snapshot() {
+    const age = this.#updatedAt === 0 ? Infinity : Date.now() - this.#updatedAt;
+    const stale = this.#updatedAt !== 0 && age > 10 * 60 * 1000;
+    return {
+      status: this.#updatedAt === 0 ? 'pending' : stale ? 'stale' : 'ready',
+      source: this.#liveAt !== 0 ? 'live' : this.#updatedAt !== 0 ? 'cache' : 'static',
+      total: this.#zen.size,
+      exposed: this.list().length,
+      lastError: this.#lastError,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 分道与元数据
+// ---------------------------------------------------------------------------
+
+/** muse-spark-* 只答 /v1/responses，jev-* 只答 /systemone，都不能进 chat 那条道。 */
+function isChatLaneModel(id) {
+  const value = String(id ?? '').toLowerCase();
+  return value.length > 0 && !value.startsWith('muse-spark') && !value.startsWith('jev');
+}
+
+/** models.dev 元数据 → 声明条目；缺元数据时用引导条目，绝不退化成裸默认值。 */
+function catalogEntry(id, catalog) {
+  const meta = catalog.metadata(id);
+  if (!meta) {
+    const fallback = [...BOOTSTRAP_MODELS, ...BOOTSTRAP_RESPONSES_MODELS].find((m) => m.id === id);
+    if (fallback) return { ...fallback };
+    return { id, contextWindow: 262144, maxTokens: 32768, supportsImages: false, thinkingLevels: [] };
+  }
+  return {
+    id,
+    contextWindow: meta.contextWindow,
+    maxTokens: meta.maxTokens,
+    supportsImages: Array.isArray(meta.modalitiesInput) ? meta.modalitiesInput.includes('image') : false,
+    thinkingLevels: effortsFor(catalog.reasoningCapability(id)),
+  };
+}
+
+function chatModelEntries(catalog) {
+  const out = [];
+  for (const id of catalog.list()) {
+    if (!isChatLaneModel(id)) continue;
+    out.push(catalogEntry(id, catalog));
+  }
+  return out;
+}
+
+function responsesModelEntries(catalog) {
+  const out = [];
+  for (const id of catalog.list()) {
+    if (!String(id).toLowerCase().startsWith('muse-spark')) continue;
+    out.push(catalogEntry(id, catalog));
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// ZCode 个人 Provider 配置
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 定位 ZCode 的数据目录（这个包要能在别人的电脑上跑，所以不能写死路径）
+// ---------------------------------------------------------------------------
+
+const SIDECAR_FILE_NAME = 'zcode-data-dir.txt';
+
+/**
+ * 个人 Provider 配置的落点，与 ZCode 的 getAppConfigDir() 一致：
+ *   {ZCODE_DATA_BASE_DIR}/.zcode/v2/provider_config.json
+ *
+ * 麻烦点在于 ZCODE_DATA_BASE_DIR **不是持久环境变量**——注册表里没有，
+ * 只是 ZCode 启动自己子进程时注入的。从资源管理器双击 .cmd 拿不到它，
+ * 于是会静默落到用户主目录，而 ZCode 读的是另一个目录，设置里就不出现分组。
+ *
+ * 所以这里改为主动探测：给若干个「可能是 ZCode 数据根」的候选目录打分，
+ * 拿得分最高的那个。判据是 {root}/v2/runtime —— ZCode 准备运行资源时会建它。
+ */
+function candidateZcodeRoots() {
+  const out = [];
+  const push = (value) => {
+    if (!value) return;
+    let resolved;
+    try {
+      resolved = path.resolve(value);
+    } catch {
+      return;
+    }
+    if (!out.includes(resolved)) out.push(resolved);
+  };
+
+  // 环境变量最权威（AI 在 ZCode 自己终端里跑时一定有）。
+  const envBase = process.env.ZCODE_DATA_BASE_DIR?.trim();
+  if (envBase) push(path.join(envBase, '.zcode'));
+  push(path.join(os.homedir(), '.zcode'));
+
+  // 再扫各固定盘：盘根、以及盘根下一层目录。够覆盖 ZCODE_DATA_BASE_DIR 被改到
+  // 别的盘/别的目录的情况，成本也就是几百次 existsSync。
+  const CAP = 500;
+  for (const letter of 'CDEFGHIJKLMNOPQRSTUVWXYZ') {
+    if (out.length >= CAP) break;
+    const root = `${letter}:\\`;
+    let entries;
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue; // 盘不存在或不可读
+    }
+    push(path.join(root, '.zcode'));
+    for (const entry of entries) {
+      if (out.length >= CAP) break;
+      if (!entry.isDirectory()) continue;
+      push(path.join(root, entry.name, '.zcode'));
+    }
+  }
+  return out;
+}
+
+/** 给一个候选 .zcode 根打分；runtime 是最强信号。 */
+function scoreZcodeRoot(root) {
+  const appConfigDir = path.join(root, 'v2');
+  let score = 0;
+  const evidence = [];
+  if (fs.existsSync(path.join(appConfigDir, 'runtime'))) {
+    score += 4;
+    evidence.push('v2/runtime');
+  }
+  if (fs.existsSync(path.join(appConfigDir, 'provider_config.json'))) {
+    score += 2;
+    evidence.push('v2/provider_config.json');
+  }
+  let newest = 0;
+  for (const name of ['tasks-index.sqlite', 'setting.json', 'config.json']) {
+    try {
+      newest = Math.max(newest, fs.statSync(path.join(appConfigDir, name)).mtimeMs);
+    } catch {
+      /* 缺这个文件不算问题 */
+    }
+  }
+  if (newest > 0) evidence.push(`v2 最近写入 ${new Date(newest).toISOString()}`);
+  return { root, baseDir: path.dirname(root), appConfigDir, score, evidence, newest };
+}
+
+/** 全部候选，按分数降序；给 --detect 看明细用。 */
+function rankZcodeRoots() {
+  return candidateZcodeRoots()
+    .map(scoreZcodeRoot)
+    .sort((a, b) => b.score - a.score || b.newest - a.newest);
+}
+
+/** 拿得分最高的候选；只有带 runtime 的（score >= 4）才算认得出来。 */
+function detectZcodeDataDir() {
+  const best = rankZcodeRoots()[0];
+  return best && best.score >= 4 ? best : null;
+}
+
+/** 旁路文件：把探测到的数据目录记下来，供 .cmd 双击时读取。 */
+function sidecarPath() {
+  return path.join(SCRIPT_DIR, SIDECAR_FILE_NAME);
+}
+
+function writeSidecar(baseDir) {
+  try {
+    const target = sidecarPath();
+    if (fs.existsSync(target) && fs.readFileSync(target, 'utf8').trim() === baseDir) return;
+    fs.writeFileSync(target, `${baseDir}\n`, 'utf8');
+  } catch {
+    // 脚本目录可能只读；写不进去不影响本次运行。
+  }
+}
+
+function readSidecar() {
+  try {
+    const value = fs.readFileSync(sidecarPath(), 'utf8').trim();
+    return value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 决定配置写到哪里：显式 --config > 环境变量 > 探测 > 旁路文件 > 用户主目录。 */
+function resolveConfigTarget(explicitPath) {
+  if (explicitPath) {
+    return { configPath: explicitPath, source: 'explicit', detail: null };
+  }
+  const appConfigFileName = 'provider_config.json';
+
+  const envBase = process.env.ZCODE_DATA_BASE_DIR?.trim();
+  if (envBase) {
+    const root = path.join(envBase, '.zcode');
+    return {
+      configPath: path.join(root, 'v2', appConfigFileName),
+      source: 'env',
+      detail: scoreZcodeRoot(root),
+    };
+  }
+
+  const detected = detectZcodeDataDir();
+  if (detected) {
+    return {
+      configPath: path.join(detected.appConfigDir, appConfigFileName),
+      source: 'detected',
+      detail: detected,
+    };
+  }
+
+  // 旁路文件只在探测失败时兜底，而且同样要过 runtime 校验——否则把这个包连同
+  // 旁路文件一起拷到别的电脑，会照着旧的机器路径去写。
+  const sidecarBase = readSidecar();
+  if (sidecarBase) {
+    const root = path.join(sidecarBase, '.zcode');
+    const detail = scoreZcodeRoot(root);
+    if (detail.score >= 4) {
+      return {
+        configPath: path.join(root, 'v2', appConfigFileName),
+        source: 'sidecar',
+        detail,
+      };
+    }
+  }
+
+  return {
+    configPath: path.join(os.homedir(), '.zcode', 'v2', appConfigFileName),
+    source: 'homedir',
+    detail: null,
+  };
+}
+
+/** 落到可疑目录时大声报警——这个坑一旦踩中，设置里就是不出现模型分组，很难猜。 */
+function warnAboutConfigTarget(resolved) {
+  if (resolved.source === 'explicit') return;
+  if (resolved.detail && resolved.detail.score >= 4) return;
+
+  console.warn('[zen] 警告：没能确认 ZCode 正在使用的数据目录。');
+  console.warn(`[zen]       本次会写到：${resolved.configPath}`);
+  console.warn('[zen]       如果 ZCode 读的不是这里，设置里就不会出现「OpenCode 免费模型」。');
+  console.warn('[zen]       跑 `node zen-proxy.mjs --detect` 看候选目录明细；');
+  console.warn('[zen]       或用 --config <完整路径> 直接指定 provider_config.json。');
+}
+
+function buildProviderRule({ id, name, apiType, port, modelIds }) {
+  return {
+    providerId: id,
+    providerName: name,
+    enabled: true,
+    config: {
+      group: 'standard-personal',
+      visibility: 'visible',
+      access: { type: 'api-key', apiKey: ANONYMOUS_KEY },
+      api: { type: apiType, baseUrl: `http://127.0.0.1:${port}/v1` },
+      personalModelIds: modelIds,
+      modelOrder: modelIds,
+    },
+  };
+}
+
+/**
+ * 每个模型的元数据走 smart 车道：ZCode 内置模板与用户自建 Provider 用的都是它，
+ * 且接受部分稀疏配置（只补你确实知道的叶子，其余交给 ZCode 自己解析）。
+ * 走 manual 车道反而要求把一堆叶子填满，且同一 Provider/Model 不能两条道并存。
+ */
+function buildModelRule(providerId, entry) {
+  const config = {
+    properties: {
+      contextWindow: entry.contextWindow,
+      inputFormat: { supportsImage: entry.supportsImages === true },
+    },
+  };
+  const optionSpecs = {};
+  if (Array.isArray(entry.thinkingLevels) && entry.thinkingLevels.length > 0) {
+    // values 就是模型选择器里那串思考档位；真正的 reasoning_effort 归一在代理层做。
+    optionSpecs.reasoningLevel = { values: entry.thinkingLevels };
+  }
+  if (Number.isFinite(entry.maxTokens)) {
+    optionSpecs.maxOutputTokens = { max: entry.maxTokens };
+  }
+  if (Object.keys(optionSpecs).length > 0) config.optionSpecs = optionSpecs;
+  return { providerId, modelId: entry.id, config };
+}
+
+/** 打印用的脱敏：绝不让 --print-config 把别人的 key 打到终端上。 */
+function redactSecrets(config) {
+  const clone = JSON.parse(JSON.stringify(config));
+  for (const rule of clone.config?.providerConfigRules?.providerRules ?? []) {
+    if (rule?.config?.access?.apiKey) rule.config.access.apiKey = '***已隐藏***';
+  }
+  return clone;
+}
+
+/** 组装整份 provider_config.json，保留用户已有的其它 Provider。 */
+function buildZcodeConfig({ existing, port, chatModels, responsesModels }) {
+  const ourRules = [
+    buildProviderRule({
+      id: PROVIDER_ID,
+      name: PROVIDER_NAME,
+      apiType: 'openai-chat-completions',
+      port,
+      modelIds: chatModels.map((m) => m.id),
+    }),
+  ];
+  if (responsesModels.length > 0) {
+    ourRules.push(
+      buildProviderRule({
+        id: RESPONSES_PROVIDER_ID,
+        name: RESPONSES_PROVIDER_NAME,
+        apiType: 'openai-responses',
+        port,
+        modelIds: responsesModels.map((m) => m.id),
+      }),
+    );
+  }
+
+  const ourModelRules = [
+    ...chatModels.map((m) => buildModelRule(PROVIDER_ID, m)),
+    ...responsesModels.map((m) => buildModelRule(RESPONSES_PROVIDER_ID, m)),
+  ];
+
+  const priorConfig = existing && existing.schemaVersion === 1 && existing.config ? existing.config : {};
+  const ourIds = new Set(ourRules.map((rule) => rule.providerId));
+
+  // 保留用户已有的 Provider；只替换我们自己那两个 providerId。
+  const keptRules = Array.isArray(priorConfig.providerConfigRules?.providerRules)
+    ? priorConfig.providerConfigRules.providerRules.filter(
+        (rule) => rule && !ourIds.has(rule.providerId),
+      )
+    : [];
+  const keptProviderModelRules = Array.isArray(priorConfig.modelConfigRules?.providerModelRules)
+    ? priorConfig.modelConfigRules.providerModelRules.filter(
+        (rule) => rule && !ourIds.has(rule.providerId),
+      )
+    : [];
+  const keptManualModelRules = Array.isArray(priorConfig.modelConfigRules?.manualProviderModelRules)
+    ? priorConfig.modelConfigRules.manualProviderModelRules.filter(
+        (rule) => rule && !ourIds.has(rule.providerId),
+      )
+    : [];
+
+  const priorOrder = Array.isArray(priorConfig.providerOrder)
+    ? priorConfig.providerOrder.filter((id) => typeof id === 'string' && !ourIds.has(id))
+    : [];
+
+  return {
+    schemaVersion: 1,
+    config: {
+      providerOrder: [...priorOrder, ...ourRules.map((rule) => rule.providerId)],
+      providerConfigRules: { providerRules: [...keptRules, ...ourRules] },
+      modelConfigRules: {
+        providerModelRules: [...keptProviderModelRules, ...ourModelRules],
+        manualProviderModelRules: keptManualModelRules,
+      },
+    },
+  };
+}
+
+function writeZcodeConfig(configPath, config) {
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  if (fs.existsSync(configPath)) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backup = `${configPath}.bak-${stamp}`;
+    try {
+      fs.copyFileSync(configPath, backup);
+    } catch {
+      /* 备份失败不阻断主流程 */
+    }
+  }
+  const temporary = `${configPath}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+  fs.renameSync(temporary, configPath);
+}
+
+// ---------------------------------------------------------------------------
+// 回环 HTTP 服务
+// ---------------------------------------------------------------------------
+
+const state = {
+  port: null,
+  requests: 0,
+  errors: 0,
+  lastError: '',
+  chatModels: [],
+  responsesModels: [],
+  catalogStatus: { status: 'pending' },
+};
+
+function isLoopbackHost(host) {
+  if (typeof host !== 'string') return false;
+  const value = host.trim().toLowerCase();
+  return (
+    value.startsWith('127.0.0.1') ||
+    value.startsWith('localhost') ||
+    value.startsWith('[::1]') ||
+    value.startsWith('::1')
+  );
+}
+
+function isLoopbackOrigin(origin) {
+  // 没有 Origin 的（CLI 侧的 Node 请求）放行，有则必须是回环。
+  if (origin === undefined || origin === null || origin === '') return true;
+  try {
+    const { hostname } = new URL(String(origin));
+    return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1';
+  } catch {
+    return false;
+  }
+}
+
+function sendJson(res, status, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(body);
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function currentModelIds() {
+  return state.chatModels.map((m) => m.id);
+}
+
+function extractErrorMessage(bodyText, status) {
+  let snippet = String(bodyText || '').slice(0, 300);
+  try {
+    const parsed = JSON.parse(bodyText);
+    snippet = (parsed && (parsed.message || (parsed.error && (parsed.error.message || parsed.error.code)))) || snippet;
+  } catch {
+    /* 保留原始片段 */
+  }
+  if (status === 403) return `上游 403（免费通道门禁或区域限制）：${snippet}`;
+  if (status === 429) return `上游 429 限速（匿名通道按 IP 计配额）：${snippet}`;
+  return `上游 ${status}：${snippet}`;
+}
+
+async function handleUpstream(req, res, upstreamPath) {
+  let hostBody;
+  try {
+    hostBody = JSON.parse(await readBody(req));
+  } catch (error) {
+    state.errors += 1;
+    state.lastError = error.message;
+    sendJson(res, 400, { error: { message: `请求体不是合法 JSON：${error.message}` } });
+    return;
+  }
+
+  // chat 道：强制流式 + 归一思考档位 + 补 bash/read 门禁工具。
+  // responses 道：只强制流式，其余原样（muse-spark 由 Zen 自己的 /v1/responses 服务）。
+  const isResponsesLane = upstreamPath.endsWith('/responses');
+  const body = isResponsesLane ? { ...hostBody, stream: true } : buildUpstreamBody(hostBody);
+  const ids = deriveRequestIDsFromWire(body);
+
+  const controller = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  req.on('aborted', onClose);
+  res.on('close', onClose);
+  const headerTimer = setTimeout(() => {
+    if (!res.headersSent) controller.abort();
+  }, UPSTREAM_HEADER_TIMEOUT_MS);
+
+  state.requests += 1;
+  const send = (payload) =>
+    fetch(`${ZEN_BASE_URL}${upstreamPath}`, {
+      method: 'POST',
+      headers: {
+        ...disguiseHeaders(ids),
+        authorization: `Bearer ${ANONYMOUS_KEY}`,
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+  try {
+    let response = await send(body);
+    // 档位是逐模型实测出来的，仍可能撞上某个模型不收某个档位；只在「确实带了
+    // reasoning_effort」且上游明确拒绝时，摘掉该字段重试一次。
+    if (
+      !response.ok &&
+      body.reasoning_effort !== undefined &&
+      RETRY_WITHOUT_EFFORT_STATUSES.includes(response.status)
+    ) {
+      console.error(
+        `[zen] reasoning_effort=${body.reasoning_effort} 被上游拒绝（HTTP ${response.status}），摘掉该字段重试`,
+      );
+      await response.text().catch(() => '');
+      const retryBody = { ...body };
+      delete retryBody.reasoning_effort;
+      response = await send(retryBody);
+    }
+    clearTimeout(headerTimer);
+
+    if (!response.ok) {
+      const bodyText = await response.text().catch(() => '');
+      state.errors += 1;
+      state.lastError = extractErrorMessage(bodyText, response.status);
+      console.error(`[zen] ${state.lastError.slice(0, 200)}`);
+      if (!res.headersSent) {
+        res.writeHead(response.status, {
+          'Content-Type': response.headers.get('content-type') || 'application/json',
+        });
+      }
+      res.end(bodyText);
+      return;
+    }
+
+    // SSE 逐块透传：两端都是同一套方言，不需要重编码，流式零损耗。
+    res.writeHead(response.status, {
+      'Content-Type': response.headers.get('content-type') || 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    if (!response.body) {
+      res.end();
+      return;
+    }
+    const upstream = Readable.fromWeb(response.body);
+    upstream.on('error', () => {
+      if (!res.writableEnded) res.end();
+    });
+    res.on('close', () => upstream.destroy());
+    upstream.pipe(res);
+  } catch (error) {
+    clearTimeout(headerTimer);
+    state.errors += 1;
+    state.lastError = error && error.message ? error.message : String(error);
+    console.error(`[zen] 代理错误：${state.lastError}`);
+    if (!res.headersSent) {
+      sendJson(res, 502, { error: { message: `上游请求失败：${state.lastError}` } });
+    } else if (!res.writableEnded) {
+      res.end();
+    }
+  }
+}
+
+function handleRequest(req, res) {
+  if (!isLoopbackHost(req.headers.host) || !isLoopbackOrigin(req.headers.origin)) {
+    sendJson(res, 403, { error: { message: 'loopback requests only' } });
+    return;
+  }
+
+  const url = new URL(req.url || '/', 'http://127.0.0.1');
+  const pathname = url.pathname;
+
+  if (req.method === 'GET' && (pathname === '/healthz' || pathname === '/')) {
+    sendJson(res, 200, {
+      ok: true,
+      port: state.port,
+      chatModels: currentModelIds().length,
+      responsesModels: state.responsesModels.length,
+      catalog: state.catalogStatus,
+      requests: state.requests,
+      errors: state.errors,
+      lastError: state.lastError,
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && (pathname === '/v1/models' || pathname === '/models')) {
+    sendJson(res, 200, {
+      object: 'list',
+      data: currentModelIds().map((id) => ({ id, object: 'model', name: id })),
+    });
+    return;
+  }
+
+  const isResponses = req.method === 'POST' && pathname.endsWith('/responses');
+  const isChat = req.method === 'POST' && pathname.endsWith('/chat/completions');
+  if (!isResponses && !isChat) {
+    sendJson(res, 404, { error: { message: 'not found' } });
+    return;
+  }
+
+  void handleUpstream(req, res, isResponses ? '/v1/responses' : '/v1/chat/completions');
+}
+
+/** 优先绑固定候选端口，这样写进配置的 baseUrl 才稳定。 */
+function listen(server, candidates) {
+  return new Promise((resolve, reject) => {
+    const ports = [...new Set(candidates.filter((p) => Number.isInteger(p) && p >= 0))];
+    const tryPort = (index) => {
+      if (index >= ports.length) {
+        reject(new Error('没有可用端口'));
+        return;
+      }
+      const onError = (error) => {
+        if (error.code === 'EADDRINUSE') {
+          server.removeListener('listening', onListening);
+          tryPort(index + 1);
+          return;
+        }
+        reject(error);
+      };
+      const onListening = () => {
+        server.removeListener('error', onError);
+        resolve(server.address().port);
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(ports[index], '127.0.0.1');
+    };
+    tryPort(0);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 入口
+// ---------------------------------------------------------------------------
+
+function parseArgs(argv) {
+  const options = { port: null, configPath: null, mode: 'serve' };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--port') {
+      options.port = Number.parseInt(argv[++i] ?? '', 10);
+    } else if (arg === '--config') {
+      options.configPath = argv[++i] ?? null;
+    } else if (arg === '--print-config') {
+      options.mode = 'print';
+    } else if (arg === '--write-config-only') {
+      options.mode = 'write';
+    } else if (arg === '--detect') {
+      options.mode = 'detect';
+    } else if (arg === '--help' || arg === '-h') {
+      options.mode = 'help';
+    } else {
+      throw new Error(`未知参数：${arg}`);
+    }
+  }
+  return options;
+}
+
+const HELP = `opencode2zcode — 把 OpenCode Zen 匿名免费模型接进 ZCode
+
+用法：
+  node zen-proxy.mjs                     起代理并写入/更新 ZCode 个人 Provider 配置
+  node zen-proxy.mjs --detect            只列出候选数据目录与判据，确认写到哪儿
+  node zen-proxy.mjs --print-config      只打印将要写入的配置（不落盘、不起服务）
+  node zen-proxy.mjs --write-config-only 只写配置后退出
+  node zen-proxy.mjs --port 41930        指定回环端口
+  node zen-proxy.mjs --config <path>     直接指定 provider_config.json 完整路径
+
+配置落点按这个顺序决定：
+  --config  >  ZCODE_DATA_BASE_DIR 环境变量  >  自动探测  >  旁路文件  >  用户主目录
+
+自动探测的判据是 {数据根}/.zcode/v2/runtime 是否存在（ZCode 准备运行资源时会建它），
+并会扫各固定盘的盘根与盘根下一层目录——因为这个包要能在别人的电脑上直接用。
+
+诊断：curl http://127.0.0.1:41930/healthz`;
+
+const SOURCE_LABELS = {
+  explicit: '手动指定',
+  env: '环境变量 ZCODE_DATA_BASE_DIR',
+  detected: '自动探测',
+  sidecar: '上次探测记录',
+  homedir: '用户主目录兜底',
+};
+
+/** --detect：把候选目录和判据全列出来，方便在别人电脑上确认。 */
+function printDetection() {
+  const ranked = rankZcodeRoots();
+  const interesting = ranked.filter((item) => item.score > 0);
+  const ignored = ranked.length - interesting.length;
+
+  console.log('ZCode 数据目录候选（✓ = 带 v2/runtime，即认得出来）：');
+  if (interesting.length === 0) console.log('  （没有得分 > 0 的候选）');
+  for (const item of interesting) {
+    console.log(`  ${item.score >= 4 ? '✓' : ' '} [${item.score}] ${item.appConfigDir}`);
+    if (item.evidence.length > 0) console.log(`          证据：${item.evidence.join('、')}`);
+  }
+  if (ignored > 0) console.log(`  （另有 ${ignored} 个 0 分候选已忽略）`);
+
+  const best = ranked[0];
+  const decided = best && best.score >= 4 ? best : null;
+  console.log('');
+  console.log(`环境变量 ZCODE_DATA_BASE_DIR：${process.env.ZCODE_DATA_BASE_DIR?.trim() || '（未设置）'}`);
+  console.log(`旁路文件：${readSidecar() ?? '（无）'}`);
+  console.log(`           ${sidecarPath()}`);
+  console.log('');
+  console.log(`结论：${decided ? `采用 ${decided.appConfigDir}` : '没探测到 —— 请用 --config 指定'}`);
+  console.log(`配置将写入：${resolveConfigTarget(null).configPath}`);
+}
+
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
+
+  if (options.mode === 'help') {
+    console.log(HELP);
+    return;
+  }
+
+  if (options.mode === 'detect') {
+    printDetection();
+    return;
+  }
+
+  const resolved = resolveConfigTarget(options.configPath ?? null);
+  const configPath = resolved.configPath;
+  const cachePath = path.join(path.dirname(configPath), CACHE_FILE_NAME);
+  warnAboutConfigTarget(resolved);
+
+  // 确认过的数据目录记进旁路文件，之后从资源管理器双击 .cmd 也能找对地方。
+  if (resolved.source !== 'explicit' && resolved.detail && resolved.detail.score >= 4) {
+    writeSidecar(resolved.detail.baseDir);
+  }
+  console.log(`[zen] 配置目标（${SOURCE_LABELS[resolved.source] ?? resolved.source}）：${configPath}`);
+
+  let server = null;
+  let port = options.port ?? DEFAULT_PORT;
+  const catalog = new ModelCatalog((url, init) => globalThis.fetch(url, init), () => {
+    applyCatalog(port, configPath);
+  }, { cachePath });
+
+  // 写配置前先读盘播种，离线启动也能写出真实清单（而不是缩水的静态兜底）。
+  await catalog.refreshOnce();
+
+  function applyCatalog(currentPort, targetConfigPath) {
+    state.chatModels = chatModelEntries(catalog);
+    state.responsesModels = responsesModelEntries(catalog);
+    state.catalogStatus = catalog.snapshot();
+    const existing = readExistingConfig(targetConfigPath);
+    const config = buildZcodeConfig({
+      existing,
+      port: currentPort,
+      chatModels: state.chatModels,
+      responsesModels: state.responsesModels,
+    });
+    rewriteConfig(targetConfigPath, config);
+  }
+
+  if (options.mode === 'print') {
+    const config = buildZcodeConfig({
+      existing: readExistingConfig(configPath),
+      port,
+      chatModels: chatModelEntries(catalog),
+      responsesModels: responsesModelEntries(catalog),
+    });
+    console.error(`# 目标文件：${configPath}`);
+    console.error('# 下面所有 apiKey 已脱敏；此模式不落盘、不起服务。');
+    console.log(JSON.stringify(redactSecrets(config), null, 2));
+    return;
+  }
+
+  if (options.mode === 'write') {
+    applyCatalog(port, configPath);
+    console.log(`已写入 ${configPath}`);
+    console.log(`chat ${state.chatModels.length} 个模型 / responses ${state.responsesModels.length} 个模型`);
+    return;
+  }
+
+  server = createServer(handleRequest);
+  port = await listen(server, options.port ? [options.port, ...PORT_CANDIDATES] : PORT_CANDIDATES);
+  state.port = port;
+  console.log(`[zen] 回环代理已监听 127.0.0.1:${port}`);
+
+  applyCatalog(port, configPath);
+  console.log(`[zen] 已同步 ZCode 配置：${configPath}`);
+  console.log(`[zen] chat ${state.chatModels.length} 个 / responses ${state.responsesModels.length} 个模型`);
+
+  void catalog.start().catch((error) => console.error(`[zen] 目录刷新失败：${error && error.message}`));
+
+  const shutdown = () => {
+    console.log('\n[zen] 正在退出');
+    catalog.stop();
+    if (server) server.close();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
+function readExistingConfig(configPath) {
+  try {
+    return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+let lastWritten = '';
+function rewriteConfig(configPath, config) {
+  const serialized = JSON.stringify(config);
+  if (serialized === lastWritten) return;
+  lastWritten = serialized;
+  try {
+    writeZcodeConfig(configPath, config);
+  } catch (error) {
+    console.error(`[zen] 写配置失败：${error && error.message}`);
+  }
+}
+
+main().catch((error) => {
+  console.error(`[zen] 启动失败：${error && error.stack ? error.stack : error}`);
+  process.exit(1);
+});

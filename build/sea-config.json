@@ -1,0 +1,7 @@
+{
+  "main": "D:\\Projects\\opencode2zcode\\build\\bundle.cjs",
+  "output": "D:\\Projects\\opencode2zcode\\build\\sea-prep.blob",
+  "disableExperimentalSEAWarning": true,
+  "useSnapshot": false,
+  "useCodeCache": true
+}

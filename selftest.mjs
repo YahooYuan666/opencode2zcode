@@ -96,6 +96,10 @@ function tempDir() {
 }
 
 function readConfig(file) {
+  return readJsonSafe(file);
+}
+
+function readJsonSafe(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
@@ -306,6 +310,68 @@ async function main() {
     }
 
     await new Promise((r) => setTimeout(r, 400));
+
+    // 钩子相关的测试要写到独立的假 HOME，不能碰用户真实的 ZCode 配置。
+    console.log('\n[5] 自启钩子的幂等性与死钩子清理（写到临时 HOME）');
+    const fakeHome = path.join(workDir, 'fakehome');
+    const hookConfigPath = path.join(fakeHome, '.zcode', 'cli', 'config.json');
+    const hookEnv = { ...baseEnv, USERPROFILE: fakeHome };
+
+    await runProxy(['--install'], hookEnv);
+    const afterFirst = readJsonSafe(hookConfigPath);
+    test('装一次就有一条 SessionStart 钩子', () => {
+      assert.equal(afterFirst.hooks.events.SessionStart.length, 1, '应恰好一条');
+    });
+    test('钩子指向本脚本且带 --ensure', () => {
+      const hook = afterFirst.hooks.events.SessionStart[0].hooks[0];
+      assert.equal(hook.type, 'process', '应是 process 类型（不过 shell）');
+      assert.ok(
+        hook.args.some((a) => String(a).endsWith('zen-proxy.mjs')),
+        `args 应指向 zen-proxy.mjs，实际 ${JSON.stringify(hook.args)}`,
+      );
+      assert.ok(hook.args.includes('--ensure'), '应带 --ensure');
+    });
+
+    await runProxy(['--install'], hookEnv);
+    test('重复安装不产生第二条（幂等）', () => {
+      const after = readJsonSafe(hookConfigPath);
+      assert.equal(after.hooks.events.SessionStart.length, 1, '重复安装后仍应只有一条');
+    });
+
+    // 模拟「早几版装过、文件已被删掉」的历史钩子
+    const withLegacy = readJsonSafe(hookConfigPath);
+    withLegacy.hooks.events.SessionStart.push({
+      hooks: [{ type: 'process', command: 'node', args: [path.join(workDir, 'ensure-proxy.mjs')] }],
+    });
+    withLegacy.hooks.events.SessionStart.push({
+      matcher: 'startup',
+      hooks: [{ type: 'command', command: 'echo 别人的钩子' }],
+    });
+    fs.writeFileSync(hookConfigPath, JSON.stringify(withLegacy, null, 2));
+
+    await runProxy(['--install'], hookEnv);
+    const afterCleanup = readJsonSafe(hookConfigPath);
+    test('指向已删文件的旧钩子被清掉', () => {
+      const ids = afterCleanup.hooks.events.SessionStart.flatMap((e) => e.hooks[0].args ?? []);
+      assert.ok(
+        !ids.some((a) => String(a).endsWith('ensure-proxy.mjs')),
+        '废弃的 ensure-proxy.mjs 钩子应被清理',
+      );
+    });
+    test('别人的钩子原样保留', () => {
+      const kept = afterCleanup.hooks.events.SessionStart.some(
+        (e) => e.hooks[0].command === 'echo 别人的钩子',
+      );
+      assert.ok(kept, '别人的 SessionStart 钩子不该被动');
+    });
+
+    await runProxy(['--uninstall'], hookEnv);
+    const afterUninstall = readJsonSafe(hookConfigPath);
+    test('卸载只摘自己那条，别人的留下', () => {
+      const remaining = afterUninstall.hooks?.events?.SessionStart ?? [];
+      assert.equal(remaining.length, 1, '应只剩别人的那一条');
+      assert.equal(remaining[0].hooks[0].command, 'echo 别人的钩子', '留下的应是别人的钩子');
+    });
   } finally {
     mock.server.close();
     fs.rmSync(workDir, { recursive: true, force: true });

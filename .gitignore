@@ -2,3 +2,9 @@
 zcode-data-dir.txt
 .proxy-start.lock
 *.bak-*
+
+# 构建产物
+node_modules/
+dist/
+build/bundle.cjs
+build/sea-prep.blob

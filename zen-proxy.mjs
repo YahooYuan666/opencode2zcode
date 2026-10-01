@@ -24,6 +24,7 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -31,8 +32,27 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
-/** 本脚本所在目录；旁路文件与配置都相对它定位。 */
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+/**
+ * 本脚本所在目录；旁路文件与配置定位都相对它。
+ *
+ * 要同时兼容三种形态：ESM 源码直跑、打成单文件 exe（SEA 里 import.meta 是空
+ * 对象，esbuild 的 CJS 兜底也给不出 url）、以及被 SEA 塞进 exe 的 CJS 包。
+ * SEA 里 __dirname 正好等于 exe 所在目录，所以拿它当兜底最省事。
+ */
+function resolveScriptDir(metaUrl, dirnameFallback) {
+  if (typeof metaUrl === 'string' && metaUrl.length > 0) {
+    try {
+      return path.dirname(fileURLToPath(metaUrl));
+    } catch {
+      /* 落到下面 */
+    }
+  }
+  if (typeof dirnameFallback === 'string' && dirnameFallback.length > 0) return dirnameFallback;
+  return process.cwd();
+}
+
+// eslint-disable-next-line no-undef
+const SCRIPT_DIR = resolveScriptDir(import.meta?.url, typeof __dirname === 'string' ? __dirname : '');
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -1275,6 +1295,306 @@ function listen(server, candidates) {
 }
 
 // ---------------------------------------------------------------------------
+// 随 ZCode 自动启动
+// ---------------------------------------------------------------------------
+
+/**
+ * 装上「随 ZCode 自动启动」：往 ZCode 的 CLI 配置里写一条 SessionStart 钩子。
+ *
+ * ZCode 的钩子必须写绝对路径（`${ZCODE_PROJECT_DIR}` 指的是用户打开的工作区，
+ * 不是本工具的位置，用不上），所以这里把**当前这个程序的路径**记进配置。
+ * 由此带来一条规则：装完就别再挪动它；挪了重跑一次即可，本函数是幂等的，
+ * 而且会顺手清掉指向已不存在位置的旧钩子。
+ *
+ * 这条钩子是不是 opencode2zcode 的，认的是**文件名**（ensure-proxy.mjs 或
+ * opencode2zcode.exe）而不是完整路径。按完整路径认的话，目录一改名就会被当成
+ * 「没装过」，于是一条新的加上去、那条死钩子留在配置里，每次开 ZCode 都白跑一次。
+ */
+
+const HOOK_TIMEOUT_MS = 12_000;
+/**
+ * 认领钩子用的文件名。注意里面**包含已经废弃的 ensure-proxy.mjs / install.mjs**
+ * ——早几版装过的人配置里留着指向它们的钩子，那些文件早没了。不把旧名字列进来，
+ * 它们会被当成「别人的钩子」永远留着，而那条钩子每次开 ZCode 都会去跑一个
+ * 不存在的文件。列进来是为了让重装/卸载能顺手清理掉。
+ */
+const HOOK_BASENAMES = new Set([
+  'zen-proxy.mjs',
+  'opencode2zcode.exe',
+  'ensure-proxy.mjs',
+  'install.mjs',
+]);
+const HOOK_MARKER_ARG = 'opencode2zcode-hook';
+const HOOK_CONFIG_RELATIVE = ['.zcode', 'cli', 'config.json'];
+const PROXY_LOCK_FILE = '.proxy-start.lock';
+
+/** 当前是不是打成 exe 在跑（SEA 里 process.execPath 就是 exe 本身）。 */
+function runningAsExe() {
+  return path.basename(process.execPath).toLowerCase() === 'opencode2zcode.exe';
+}
+
+/**
+ * 写进 ZCode 配置的路径要好看也要稳。Windows 有时会把 process.execPath 缩成
+ * 8.3 短名（C:\Users\ADMINI~1\…），那种路径在禁用短名、或目录被重建后就失效，
+ * 所以统一换成真实长路径。
+ */
+function stableExecutablePath() {
+  try {
+    return fs.realpathSync.native(process.execPath);
+  } catch {
+    return process.execPath;
+  }
+}
+
+/** 把自己叫起来的 argv：源码形态是 node + 脚本路径，exe 形态直接跑 exe。 */
+function selfInvocation(extraArgs) {
+  if (runningAsExe()) return { command: stableExecutablePath(), args: [...extraArgs] };
+  const script = process.argv[1] || path.join(SCRIPT_DIR, 'zen-proxy.mjs');
+  return { command: process.execPath, args: [script, ...extraArgs] };
+}
+
+function zcodeCliConfigPath() {
+  const home = process.env.USERPROFILE?.trim() || os.homedir();
+  return path.join(home, ...HOOK_CONFIG_RELATIVE);
+}
+
+function readJsonSafe(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonWithBackup(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (fs.existsSync(file)) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    try {
+      fs.copyFileSync(file, `${file}.bak-${stamp}`);
+    } catch {
+      /* 备份失败不阻断 */
+    }
+  }
+  const temporary = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  fs.renameSync(temporary, file);
+}
+
+function hookArgsOf(entry) {
+  const list = Array.isArray(entry?.hooks) ? entry.hooks : [];
+  for (const hook of list) {
+    if (Array.isArray(hook?.args)) return hook.args;
+  }
+  return [];
+}
+
+function isOurHook(entry) {
+  return hookArgsOf(entry).some((arg) => {
+    if (typeof arg !== 'string') return false;
+    if (arg === HOOK_MARKER_ARG) return true;
+    return HOOK_BASENAMES.has(path.basename(arg).toLowerCase());
+  });
+}
+
+/** 钩子指向的东西还在不在。不在就是条死钩子，装的时候顺手清掉。 */
+function hookTargetExists(entry) {
+  for (const arg of hookArgsOf(entry)) {
+    if (typeof arg !== 'string' || arg === HOOK_MARKER_ARG) continue;
+    if (HOOK_BASENAMES.has(path.basename(arg).toLowerCase())) return fs.existsSync(arg);
+  }
+  return true;
+}
+
+/**
+ * 钩子该怎么把本程序叫起来。打成 exe 时直接跑 exe（目标机上没 node 也能用），
+ * 源码形态则是 node + 本脚本 + --ensure。两种都靠脚本文件名认领。
+ */
+function hookInvocation() {
+  return selfInvocation(runningAsExe() ? [HOOK_MARKER_ARG] : ['--ensure']);
+}
+
+function installAutostart() {
+  const configPath = zcodeCliConfigPath();
+  const config = readJsonSafe(configPath) ?? {};
+  config.hooks = config.hooks && typeof config.hooks === 'object' ? config.hooks : {};
+  config.hooks.enabled = true;
+  const events =
+    config.hooks.events && typeof config.hooks.events === 'object' ? config.hooks.events : {};
+  const existing = Array.isArray(events.SessionStart) ? events.SessionStart : [];
+  const invocation = hookInvocation();
+
+  const entry = {
+    hooks: [
+      { type: 'process', command: invocation.command, args: invocation.args, timeoutMs: HOOK_TIMEOUT_MS },
+    ],
+  };
+
+  // 别人的钩子原样留下；我们自己那条永远只留一条，且永远指向当前这个程序。
+  const foreign = existing.filter((item) => !isOurHook(item));
+  const stale = existing.filter((item) => isOurHook(item) && !hookTargetExists(item));
+
+  events.SessionStart = [entry, ...foreign];
+  config.hooks.events = events;
+  writeJsonWithBackup(configPath, config);
+
+  if (stale.length > 0) {
+    console.log(`[autostart] 清掉了 ${stale.length} 条指向已不存在位置的旧钩子。`);
+  }
+  console.log(`[autostart] 已写入 SessionStart 钩子：${configPath}`);
+  console.log(`[autostart] 钩子命令：${invocation.command} ${invocation.args.join(' ')}`);
+  console.log('[autostart] 从现在起，启动 ZCode 会自动静默拉起代理，不用再双击任何东西。');
+  console.log('[autostart] 注意：上面这个路径是写死的。以后若移动或改名了，');
+  console.log('[autostart]        到新位置重跑一次 --install 即可（旧的会被自动替换）。');
+}
+
+function uninstallAutostart() {
+  const configPath = zcodeCliConfigPath();
+  const config = readJsonSafe(configPath);
+  if (!config?.hooks?.events?.SessionStart) {
+    console.log('[autostart] 配置里没有 SessionStart 钩子，无需卸载。');
+    return;
+  }
+  const before = config.hooks.events.SessionStart.length;
+  const kept = config.hooks.events.SessionStart.filter((entry) => !isOurHook(entry));
+  const removed = before - kept.length;
+
+  if (removed === 0) {
+    console.log('[autostart] 没有属于 opencode2zcode 的钩子（别人的钩子一个没动）。');
+    return;
+  }
+
+  if (kept.length === 0) delete config.hooks.events.SessionStart;
+  else config.hooks.events.SessionStart = kept;
+  if (Object.keys(config.hooks.events).length === 0) delete config.hooks.events;
+  // 事件清空后剩下的 hooks.enabled 只是个空开关，装之前没有就整个撤掉。
+  if (config.hooks.events === undefined) delete config.hooks;
+
+  writeJsonWithBackup(configPath, config);
+  console.log(`[autostart] 已移除 ${removed} 条自启钩子：${configPath}`);
+  console.log('[autostart] 其它 mcp / plugins / hooks 配置保持原样。');
+}
+
+// ---------------------------------------------------------------------------
+// 静默拉起：SessionStart 钩子触发时走这条路
+// ---------------------------------------------------------------------------
+
+/**
+ * ZCode 一启动就检查代理在不在，不在就静默拉起。
+ *
+ * 几条被 ZCode 钩子契约逼出来的硬约束：
+ *   - 钩子**永远同步执行**，`async: true` 不生效。所以本函数自己负责
+ *     「快速判断 → 需要时才等一小会儿 → 无论如何都退出 0」。
+ *   - 绝不能 block 或 deny 会话：任何异常都吞掉。
+ *   - 拉起的子进程必须 detached + windowsHide，否则用户会看见一个黑窗口凭空弹出。
+ *   - 单实例保护：并发启动多个 ZCode 会话时只允许一个真正拉起。否则第二个实例
+ *     会绑到 41931 并把配置里的 baseUrl 改掉，用户会突然发现模型不能用。
+ */
+
+const LOCK_STALE_SECONDS = 20;
+const ENSURE_TIMEOUT_MS = 6000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function probePort(port, timeoutMs = 700) {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/healthz`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) return false;
+    const body = await response.json();
+    return Boolean(body && body.ok === true);
+  } catch {
+    return false;
+  }
+}
+
+async function anyProxyAlive() {
+  for (const port of PORT_CANDIDATES) {
+    if (await probePort(port)) return port;
+  }
+  return null;
+}
+
+/** 抢排他锁；抢到返回 true。文件不存在或已过期都视为可抢。 */
+function acquireLock(lockFile) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      fs.writeFileSync(lockFile, `${process.pid}\n`, { flag: 'wx' });
+      return true;
+    } catch (error) {
+      if (!error || error.code !== 'EEXIST') return false;
+      let age = Infinity;
+      try {
+        age = (Date.now() - fs.statSync(lockFile).mtimeMs) / 1000;
+      } catch {
+        age = Infinity;
+      }
+      if (age > LOCK_STALE_SECONDS) {
+        // 陈锁：上一次拉起过程崩了留下的，清掉重抢。
+        try {
+          fs.unlinkSync(lockFile);
+        } catch {
+          /* 抢不到就算了 */
+        }
+        continue;
+      }
+      return false;
+    }
+  }
+  return false;
+}
+
+function releaseLock(lockFile) {
+  try {
+    fs.unlinkSync(lockFile);
+  } catch {
+    /* 本来就没有 */
+  }
+}
+
+/** 把本程序以「彻底脱离、无窗口」的方式再拉起一份（不带 --ensure，进去就是服务模式）。 */
+function spawnSelfDetached() {
+  const self = selfInvocation([]);
+  const child = spawn(self.command, self.args, {
+    cwd: SCRIPT_DIR,
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
+  return child.pid;
+}
+
+async function ensureProxyRunning() {
+  const lockFile = path.join(SCRIPT_DIR, PROXY_LOCK_FILE);
+  if (await anyProxyAlive()) return;
+
+  if (!acquireLock(lockFile)) {
+    // 别的实例正在拉起，等它一下就到点了。
+    const deadline = Date.now() + ENSURE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await sleep(400);
+      if (await anyProxyAlive()) return;
+    }
+    return;
+  }
+
+  try {
+    // 拿到锁之后再确认一次：可能正好在等锁期间别人已经拉起来了。
+    if (await anyProxyAlive()) return;
+    spawnSelfDetached();
+    const deadline = Date.now() + ENSURE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await sleep(300);
+      if (await anyProxyAlive()) return;
+    }
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
 
@@ -1292,6 +1612,12 @@ function parseArgs(argv) {
       options.mode = 'write';
     } else if (arg === '--remove-provider') {
       options.mode = 'remove';
+    } else if (arg === '--install') {
+      options.mode = 'install';
+    } else if (arg === '--uninstall') {
+      options.mode = 'uninstall';
+    } else if (arg === HOOK_MARKER_ARG || arg === '--ensure') {
+      options.mode = 'ensure';
     } else if (arg === '--detect') {
       options.mode = 'detect';
     } else if (arg === '--help' || arg === '-h') {
@@ -1307,16 +1633,18 @@ const HELP = `opencode2zcode — 把 OpenCode Zen 匿名免费模型接进 ZCode
 
 用法：
   node zen-proxy.mjs                     起代理并写入/更新 ZCode 个人 Provider 配置
+  node zen-proxy.mjs --install           装上「随 ZCode 自动启动」（幂等，推荐）
+  node zen-proxy.mjs --uninstall         卸掉自启钩子并摘掉本工具的 Provider
+  node zen-proxy.mjs --ensure            检查代理在不在，不在就静默拉起（供钩子调用）
   node zen-proxy.mjs --detect            只列出候选数据目录与判据，确认写到哪儿
   node zen-proxy.mjs --print-config      只打印将要写入的配置（不落盘、不起服务）
   node zen-proxy.mjs --write-config-only 只写配置后退出
-  node zen-proxy.mjs --remove-provider   从 ZCode 配置里摘掉本工具的两个 Provider
+  node zen-proxy.mjs --remove-provider   只从 ZCode 配置里摘掉本工具的两个 Provider
   node zen-proxy.mjs --port 41930        指定回环端口
   node zen-proxy.mjs --config <path>     直接指定 provider_config.json 完整路径
 
-装成「随 ZCode 自动启动」（装完就不用再管，也没有黑窗口）：
-  node install.mjs               写入 SessionStart 钩子
-  node install.mjs --uninstall   移除该钩子
+装完就不用再管了：启动 ZCode 时会自动静默拉起代理，不会有任何窗口。
+人类用户直接双击 install-autostart.cmd 即可（它就是 --install 的壳）。
 
 配置落点按这个顺序决定：
   --config  >  ZCODE_DATA_BASE_DIR 环境变量  >  自动探测  >  旁路文件  >  用户主目录
@@ -1364,6 +1692,39 @@ async function main() {
 
   if (options.mode === 'help') {
     console.log(HELP);
+    return;
+  }
+
+  // 钩子专用路径：必须在任何目录探测、任何配置读写之前短路返回，
+  // 而且无论成功失败退出码恒为 0，绝不能影响 ZCode 开会话。
+  if (options.mode === 'ensure') {
+    try {
+      await ensureProxyRunning();
+    } catch {
+      /* 吞掉一切 */
+    }
+    return;
+  }
+
+  if (options.mode === 'install') {
+    installAutostart();
+    return;
+  }
+
+  if (options.mode === 'uninstall') {
+    uninstallAutostart();
+    const target = resolveConfigTarget(options.configPath ?? null);
+    const result = removeOurProviders(readExistingConfig(target.configPath));
+    if (result && result.removed > 0) {
+      writeZcodeConfig(target.configPath, { schemaVersion: 1, config: result.config });
+      lastWritten = '';
+      console.log(
+        `[zen] 已从 ${target.configPath} 移除 ${result.removed} 个 Provider（${PROVIDER_ID} / ${RESPONSES_PROVIDER_ID}）`,
+      );
+      console.log('[zen] 你的其它 Provider 原样保留。');
+    } else {
+      console.log('[zen] 配置里没有本工具的 Provider，无需清理。');
+    }
     return;
   }
 

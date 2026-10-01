@@ -18,11 +18,22 @@
 
 ## 1. 前置检查
 
+**先确认用户手上是哪种包**，这决定后面所有命令要不要带 `node`：
+
+| 包里有 | 用户需要 | 命令写法 |
+| --- | --- | --- |
+| `opencode2zcode.exe` | **什么都不用装** | `opencode2zcode.exe <参数>` |
+| 只有 `zen-proxy.mjs` | **Node.js 18+** | `node zen-proxy.mjs <参数>` |
+
+如果只有 `zen-proxy.mjs`：
+
 ```bash
 node --version
 ```
 
-需要 **Node 18 或更高**（用到内置 `fetch`）。没有就停下来，告诉用户先装 Node.js，不要自行安装系统级软件。
+需要 **Node 18 或更高**（用到内置 `fetch`）。没有就停下来，告诉用户：可以自己装
+Node.js，**或者向发布者要一个 `opencode2zcode.exe`**（单文件、零依赖，不需要装任何东西）。
+不要自行替用户安装系统级软件。
 
 记下本目录的绝对路径，后面叫它 `<PKG>`：
 
@@ -172,41 +183,48 @@ ZCode 大约 **1 秒**轮询一次该文件。若设置页没刷新，让用户�
 
 前面几步只是把配置写好了，代理本身还没跑。这一步让它以后自动跑。
 
+**先看用户手上是哪种包**，两条命令任选其一，参数完全一样：
+
 ```bash
-node install.mjs
+# 源码包（用户有 Node.js 18+）
+node zen-proxy.mjs --install
+
+# 单文件 exe（用户没装 Node.js，零依赖）
+opencode2zcode.exe --install
 ```
 
 **期望输出**：
 
 ```
-[install] 已写入 SessionStart 钩子：C:\Users\<用户>\.zcode\cli\config.json
-[install] 钩子命令：<node 的绝对路径> <PKG>\ensure-proxy.mjs
-[install] 从现在起，启动 ZCode 会自动静默拉起代理，不用再双击任何东西。
+[autostart] 已写入 SessionStart 钩子：C:\Users\<用户>\.zcode\cli\config.json
+[autostart] 钩子命令：<本程序的绝对路径> --ensure
+[autostart] 从现在起，启动 ZCode 会自动静默拉起代理，不用再双击任何东西。
 ```
 
-如果第一行显示的是「已写入 SessionStart 钩子」，说明装过了——**这个命令是幂等的**，
-重复执行安全：只会保证有且只有一条属于本工具的钩子，且指向当前目录。
+重复执行安全——**这个命令是幂等的**：只会保证有且只有一条属于本工具的钩子，
+且永远指向当前这个位置。如果输出里出现「清掉了 N 条指向已不存在位置的旧钩子」，
+说明之前装在别处过，正常。
 
-它做了什么：往 ZCode 的 CLI 配置里加一条 `SessionStart` 钩子，指向本目录的
-`ensure-proxy.mjs`。那个脚本在 ZCode 启动时检查代理在不在，不在就**静默**拉起
+它做了什么：往 ZCode 的 CLI 配置里加一条 `SessionStart` 钩子，指向本程序并带
+`--ensure`。ZCode 启动时它会检查代理在不在，不在就**静默**拉起
 （`detached` + `windowsHide`，不弹窗口），并最多等 6 秒；无论成败退出码恒为 0，
 不会影响 ZCode 开会话。
 
 > **⚠️ 必须在「最终摆放位置」上执行这一步。**
-> ZCode 的钩子只认绝对路径，所以上面那条命令把**当前这个目录**的路径记进了配置。
-> 如果你打算把文件夹挪到别处，**先挪完再执行这一步**；已经挪过了也没关系，
+> ZCode 的钩子只认绝对路径，所以上面那条命令把**当前这个位置**的路径记进了配置。
+> 如果你打算把文件挪到别处，**先挪完再执行这一步**；已经挪过了也没关系，
 > 到新位置重跑一次即可——它会认出自己的旧钩子并替换，指向已不存在路径的那条会被清掉。
 > （ZCode 的 `${ZCODE_PROJECT_DIR}` 是**工作区**相对路径，指向用户打开的项目文件夹，
 > 不是本工具的安装位置，所以这里用不上。）
 
 > **这一步会修改 ZCode 的配置文件。** 动手前告诉用户你要改什么；
-> `install.mjs` 会自动在同目录留一份 `config.json.bak-<时间戳>`。
+> 程序会自动在同目录留一份 `config.json.bak-<时间戳>`。
 > 用户的其它 `mcp` / `plugins` / 别人的 `SessionStart` 钩子都不会被碰。
 
 装完立刻验证一次（不必等下次开 ZCode）：
 
 ```bash
-node ensure-proxy.mjs
+node zen-proxy.mjs --ensure        # exe 则是：opencode2zcode.exe --ensure
 curl http://127.0.0.1:41930/healthz
 ```
 
@@ -291,13 +309,13 @@ OpenCode Zen 的匿名免费档位接受一个公开占位符 `public` 作为凭
 | 现象 | 排查 |
 | --- | --- |
 | 设置里没有「OpenCode 免费模型」 | 先看 `配置目标` 那行的括号内容，是不是「用户主目录兜底」；再看 `--detect` 的结论路径对不对 |
-| 有分组但一发消息就失败 | 代理没在跑。`curl http://127.0.0.1:41930/healthz` 确认。手动 `node ensure-proxy.mjs` 能拉起来就说明钩子没生效——重跑 `node install.mjs` |
+| 有分组但一发消息就失败 | 代理没在跑。`curl http://127.0.0.1:41930/healthz` 确认。手动跑 `--ensure` 能拉起来就说明钩子没生效——重跑一次 `--install` |
 | 报 403 `FreeTierError` | 伪装头或请求体门禁没过，上游收紧了。改 `zen-proxy.mjs` 里的 `OPENCODE_CLIENT_VERSION` 跟官方 CLI 版本号 |
 | 报 429 | 匿名通道按 IP 限速，等一会儿 |
 | 报 400 `invalid request` | 看代理 stderr 有没有「摘掉该字段重试」的日志；重试也失败说明这个模型当前不可用 |
 | 模型列表比预期少 | 看 `/healthz` 的 `catalog.status`，`static` = 还没联网成功，用的是内置兜底清单。目录里判定为「已下架」的模型会被有意剔掉，属正常 |
-| ZCode 启动时什么都没发生，模型不生效 | 钩子指向的路径可能失效了（本目录被移动/改名过）。在本目录下重跑 `node install.mjs`，它会替换掉旧的那条 |
-| 改了代码怕改坏 | 跑 `node selftest.mjs`，16 项全过再交付 |
+| ZCode 启动时什么都没发生，模型不生效 | 钩子指向的路径可能失效了（文件被移动/改名过）。在新位置重跑一次 `--install`，它会替换掉旧的那条 |
+| 改了代码怕改坏 | 跑 `node selftest.mjs`，22 项全过再交付 |
 
 代理日志走 **stderr**，`--print-config` 的 JSON 走 **stdout**，方便重定向。
 
@@ -306,9 +324,9 @@ OpenCode Zen 的匿名免费档位接受一个公开占位符 `public` 作为凭
 ## 10. 命令速查
 
 ```bash
-node install.mjs                        # 装上「随 ZCode 自动启动」（幂等）
-node install.mjs --uninstall            # 卸掉自启钩子
-node ensure-proxy.mjs                   # 手动触发一次检查+拉起（无窗口）
+node zen-proxy.mjs --install            # 装上「随 ZCode 自动启动」（幂等）
+node zen-proxy.mjs --uninstall          # 卸掉钩子 + 摘掉本工具的 Provider
+node zen-proxy.mjs --ensure             # 手动触发一次检查+拉起（无窗口）
 node zen-proxy.mjs --detect             # 看探测到的数据目录与判据
 node zen-proxy.mjs --print-config       # 看要写什么（apiKey 已脱敏，不落盘）
 node zen-proxy.mjs --write-config-only  # 只写配置后退出
@@ -323,15 +341,15 @@ node zen-proxy.mjs --help               # 全部参数
 ## 11. 本包的文件
 
 ```
-zen-proxy.mjs          回环代理 + ZCode 配置同步（唯一必需文件，无外部依赖）
-ensure-proxy.mjs       SessionStart 钩子：检查代理在不在，不在就静默拉起（无窗口）
-install.mjs            装/卸自启钩子
-install-autostart.cmd  双击这个 = 装上「随 ZCode 自动启动」
+zen-proxy.mjs          全部功能都在这一个文件里（代理 + 配置同步 + 自起停 + 静默拉起）
+install-autostart.cmd  双击这个 = 装上「随 ZCode 自动启动」（需要 Node.js）
 uninstall.cmd          双击这个 = 彻底还原
 start-zen-proxy.cmd    手动前台启动（调试用）
-selftest.mjs           自测，16 项
+selftest.mjs           自测，22 项
 README.md              给人看的说明
 AI-SETUP.md            本文件，给 AI 看的安装说明
+
+opencode2zcode.exe     单文件版（如果对方没装 Node.js 就给这个，零依赖）
 ```
 
 **不要**把 `zcode-data-dir.txt` 拷到别的电脑——它记录的是源机器上的数据目录。

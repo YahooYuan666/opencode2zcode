@@ -45,26 +45,39 @@ skills / commands / hooks / mcpServers
 
 ## 用法
 
-需要 **Node 18+**（用到内置 `fetch`）。本机实测 Node v24.15.0 可用。
+有**两种分发形式**，按对方机器上有没有 Node.js 选一个：
+
+| 形式 | 对方需要装什么 | 怎么用 |
+| --- | --- | --- |
+| **单文件 `opencode2zcode.exe`** | **什么都不用装** | 拷这一个文件过去，双击或命令行跑 |
+| 源码包（本目录） | Node.js 18+ | 解压后双击 `install-autostart.cmd` |
+
+两种形式**跑的是同一份源码**——exe 是用 esbuild + Node 官方 SEA 机制从
+`zen-proxy.mjs` 构建出来的，不存在「exe 版和脚本版行为不一样」的问题。
 
 ### 装一次，之后就不用管了（推荐）
 
 ```bash
+# 有 Node.js：
 install-autostart.cmd
+# 或没有 Node.js：
+opencode2zcode.exe --install
 ```
 
 就这一步。它往 ZCode 的 CLI 配置里写一条 `SessionStart` 钩子，之后**每次启动 ZCode
 都会自动把代理拉起来**——**没有黑窗口，不用双击，不用记着开**。装完直接去
 ZCode 的 **设置 → 模型服务** 看「OpenCode 免费模型」分组。
 
-想彻底还原，双击 `uninstall.cmd`：它会删掉那条钩子、并把本工具的两个 Provider
-从你的个人配置里摘掉，你的其它 Provider 和其它钩子一个字都不动。
+想彻底还原，双击 `uninstall.cmd`（或 `opencode2zcode.exe --uninstall`）：它会删掉那条
+钩子、并把本工具的两个 Provider 从你的个人配置里摘掉，你的其它 Provider 和其它
+钩子一个字都不动。
 
 <details>
 <summary>不想装自启，手动跑（调试用）</summary>
 
 ```bash
 node zen-proxy.mjs        # 起代理 + 写配置，窗口要一直开着
+opencode2zcode.exe        # 同上，exe 形态
 ```
 
 窗口关掉代理就停。适合排查问题，不适合日常用。
@@ -73,38 +86,33 @@ node zen-proxy.mjs        # 起代理 + 写配置，窗口要一直开着
 
 ### 命令
 
+两种形式参数完全一样：
+
 ```bash
-# 只想看会写成什么，不落盘：
-node zen-proxy.mjs --print-config
+--install            装上「随 ZCode 自动启动」（幂等，推荐）
+--uninstall          卸掉钩子 + 摘掉本工具的两个 Provider
+--ensure             检查代理在不在，不在就静默拉起（供钩子调用，一般不用手敲）
+--detect             只列出候选数据目录与判据
+--print-config       只打印将要写入的配置（所有 apiKey 已脱敏），不落盘不起服务
+--write-config-only  只写配置后退出
+--remove-provider    只从 ZCode 配置里摘掉本工具的两个 Provider
+--port <n>           指定回环端口，默认 41930
+--config <path>      直接指定 provider_config.json 完整路径
+--help               帮助
+```
 
-# 只写配置不起服务：
-node zen-proxy.mjs --write-config-only
+跑自测（本地 mock 上游，不打真实网络，22 项）：
 
-# 从 ZCode 配置里摘掉本工具的两个 Provider（卸载用）
-node zen-proxy.mjs --remove-provider
-
-# 跑自测（本地 mock 上游，不打真实网络）
+```bash
 node selftest.mjs
 ```
 
-### 参数
-
-| 参数 | 说明 |
-| --- | --- |
-| `--port <n>` | 回环端口，默认 `41930`（被占用时自动退到 41931/41932/41933） |
-| `--config <path>` | 直接指定 `provider_config.json` 完整路径，跳过自动探测 |
-| `--detect` | 只列出候选数据目录与判据，确认要写到哪儿 |
-| `--print-config` | 只打印合并后的配置（**所有 apiKey 已脱敏**），不落盘不起服务 |
-| `--write-config-only` | 只写配置后退出 |
-| `--remove-provider` | 从 ZCode 配置里摘掉本工具的两个 Provider，其它 Provider 不动 |
-| `--help` | 帮助 |
-
-环境变量：
+### 环境变量
 
 | 变量 | 说明 |
 | --- | --- |
-| `ZEN_BASE_URL` | 覆盖上游根地址，默认 `https://opencode.ai/zen`。指向本地 mock 便于自测（`selftest.mjs` 就是这么跑的） |
-| `ZCODE_DATA_BASE_DIR` | 个人 Provider 配置落点的**最高优先级**依据；没有它就自动探测（见下），**不是**直接退到用户主目录 |
+| `ZEN_BASE_URL` | 覆盖上游根地址，默认 `https://opencode.ai/zen`。指向本地 mock 便于自测 |
+| `ZCODE_DATA_BASE_DIR` | 个人 Provider 配置落点的**最高优先级**依据；没有它就自动探测，**不是**直接退到用户主目录 |
 
 ### 诊断
 
@@ -262,7 +270,7 @@ POST /v1/chat/completions  big-pickle      -> 200，SSE 流式正常返回
 POST /v1/responses  muse-spark-1.3-...     -> 上游 RegionError（见下）
 POST 不存在的模型                            -> 上游 ModelError + 401，原样透传
 非回环 Host 访问 /healthz                    -> 403 loopback requests only
-node selftest.mjs                          -> 16/16 通过（本地 mock，不打真实网络）
+node selftest.mjs                          -> 22/22 通过（本地 mock，不打真实网络）
 ```
 
 配置里实际是 **8 个模型**：`opencode-free` 7 个（chat 道）+ `opencode-free-responses`
@@ -295,7 +303,7 @@ node selftest.mjs                          -> 16/16 通过（本地 mock，不�
 | 对话报 403 `FreeTierError` | 伪装头或体门禁没过，上游收紧了。`x-opencode-client` / `user-agent` 的版本号可能要跟着官方 CLI 更新 |
 | 对话报 429 | 匿名通道按 IP 限速，等一会儿 |
 | 对话报 400 `invalid request` | 看代理 stderr 有没有「摘掉该字段重试」的日志；若重试也 400，多半是这个模型当前不可用 |
-| 想撤销 | 双击 `uninstall.cmd`（钩子和 Provider 一起清干净）。只想清 Provider 就 `node zen-proxy.mjs --remove-provider`；只想停自启就 `node install.mjs --uninstall` |
+| 想撤销 | 双击 `uninstall.cmd`（钩子和 Provider 一起清干净）。只想清 Provider 就 `node zen-proxy.mjs --remove-provider`；只想停自启就 `node zen-proxy.mjs --uninstall` |
 
 代理的日志都走 **stderr**，`--print-config` 的 JSON 走 **stdout**，方便重定向。
 
@@ -315,72 +323,102 @@ node selftest.mjs                          -> 16/16 通过（本地 mock，不�
 ## 文件
 
 ```
-zen-proxy.mjs          回环代理 + ZCode 配置同步（唯一必需文件，无外部依赖）
-ensure-proxy.mjs       SessionStart 钩子：检查代理在不在，不在就静默拉起（无窗口）
-install.mjs            装/卸自启钩子（读写 ZCode 的 CLI 配置）
-install-autostart.cmd  双击这个 = 装上「随 ZCode 自动启动」
+zen-proxy.mjs          全部功能都在这一个文件里，无外部依赖
+                       （代理 + 配置同步 + 自启钩子的装/卸 + 静默拉起）
+install-autostart.cmd  双击这个 = 装上「随 ZCode 自动启动」（需要 Node.js）
 uninstall.cmd          双击这个 = 彻底还原（钩子 + Provider 一起清）
 start-zen-proxy.cmd    手动前台启动（调试用，窗口要开着）
-selftest.mjs           自测：本地 mock 上游，16 项，不打真实网络
+selftest.mjs           自测：本地 mock 上游，22 项，不打真实网络
 README.md              本文件，给人看的说明
 AI-SETUP.md            给 AI 助手看的安装说明（拿到包的是 AI 时先读那份）
+
+build/build-exe.mjs    构建脚本：从 zen-proxy.mjs 打出单文件 exe
+dist/opencode2zcode.exe 构建产物（不入库），对方零依赖直接用
+
 zcode-data-dir.txt     运行后自动生成，记录探测到的数据根；不要拷到别的电脑
 ```
 
 ## 拿到别人的电脑上用
 
-整个目录可以直接拷走，**不含任何机器专属路径**——数据目录靠自动探测。
+### 不想让对方装 Node.js（推荐）
 
-### 分享给人类用户
+发 **`opencode2zcode.exe`** 这一个文件过去（87 MB，里面含 node 运行时）。
+对方把它放哪都行，然后：
 
-把整个文件夹（或 zip）发过去，对方**双击 `install-autostart.cmd`** 就完事。
-装完不用再管，也没有黑窗口。
+```
+opencode2zcode.exe --install
+```
 
-### 分享给「让对方的 AI 来装」
+一条命令搞定，**不用装任何东西、不用配环境变量**。装完启动 ZCode 就自动生效。
+
+### 想发小包
+
+发整个目录或 zip（不含 exe，约 50 KB），对方需要 **Node.js 18+**，
+双击 `install-autostart.cmd` 即可。
+
+两种形式**同一份源码**，行为一致。包里**不含任何机器专属路径**——数据目录靠自动探测。
+
+### 让对方的 AI 来装
 
 让那个 AI **先读 `AI-SETUP.md`**，里面有逐步命令、每步的期望输出、以及各种失败分支。
-`AI-SETUP.md` 第 6 节就是安装自启那一步。
+第 6 节就是安装自启那一步。
 
 ### ⚠️ 唯一需要对方动手的事
 
-ZCode 的钩子必须写**绝对路径**，所以 `install.mjs` 会把**当时那个位置的**
-`ensure-proxy.mjs` 路径记进 ZCode 的配置。这就带来一条规则：
+ZCode 的钩子必须写**绝对路径**，所以安装命令会把**当时那个位置**的可执行文件路径
+记进 ZCode 的配置。这就带来一条规则：
 
-> **`install-autostart.cmd` 必须在「最终摆放位置」上运行。**
-> 对方把文件夹解压到哪、就在哪运行——不要先在 A 处运行、再把文件夹挪到 B 处。
+> **必须在「最终摆放位置」上执行安装。**
+> 对方把文件解压到哪、就在哪运行——不要先在 A 处运行、再挪到 B 处。
 
-如果确实挪过了，**到新位置重跑一次 `install-autostart.cmd` 就行**：它会认出自己的
-旧钩子并替换掉，指向已不存在的旧路径那条会被自动清掉，不会越堆越多。
+如果确实挪过了，**到新位置重跑一次安装命令就行**：它会认出自己的旧钩子并替换掉，
+指向已不存在的旧路径那条会被自动清掉，不会越堆越多。
 
 （为什么非得是绝对路径：ZCode 的钩子变量 `${ZCODE_PROJECT_DIR}` 是**工作区**相对
-路径，指向的是你打开的项目文件夹，不是本工具的安装位置，用不上。）
+路径，指向的是用户打开的项目文件夹，不是本工具的安装位置，用不上。）
 
 ## 自启是怎么做到的（以及它的边界）
 
-`install.mjs` 往 ZCode 的 CLI 配置（`{用户目录}/.zcode/cli/config.json`）里加一条：
+`--install` 往 ZCode 的 CLI 配置（`{用户目录}/.zcode/cli/config.json`）里加一条：
 
 ```json
 { "hooks": { "enabled": true, "events": { "SessionStart": [
   { "hooks": [ { "type": "process",
-                 "command": "<node 的绝对路径>",
-                 "args": ["<本目录>/ensure-proxy.mjs"],
+                 "command": "<本程序的绝对路径>",
+                 "args": ["--ensure"],
                  "timeoutMs": 12000 } ] } ] } } }
 ```
+
+源码形态下 `command` 是 node 的绝对路径、`args` 是 `[zen-proxy.mjs 的路径, "--ensure"]`；
+exe 形态下 `command` 直接是那个 exe。
 
 几点说明：
 
 - **`process` 类型而不是 `command`**，直接给可执行文件 + 参数数组，不过 shell，Windows 上最稳。
-- **node 用绝对路径写死**，免得目标机 PATH 里没有 node 时钩子静默失效。
-- 钩子是**同步执行**的，`async` 字段不生效。所以 `ensure-proxy.mjs` 自己负责快速判断：
+- **路径用绝对路径写死**，免得目标机 PATH 里什么都没有时钩子静默失效；
+  exe 形态还会把 8.3 短名还原成长路径，那种短名在目录被重建后会失效。
+- 钩子是**同步执行**的，`async` 字段不生效。所以 `--ensure` 自己负责快速判断：
   代理在就直接退出（毫秒级），不在才拉起来并最多等 6 秒，**无论成败退出码恒为 0**，
   绝不影响 ZCode 开会话。
 - 子进程用 `detached` + `windowsHide` 拉起，**完全脱离且不弹窗**——这就是「看不见黑窗口」的来源。
 - 有**单实例保护**（排他锁文件 + 端口健康检查）。否则同时开两个 ZCode 会话时，
   第二个实例会绑到 41931 并把配置里的 `baseUrl` 改掉，用户会突然发现模型不能用。
+- 认领自己的钩子靠**文件名**而不是完整路径，并且**把已经废弃的 `ensure-proxy.mjs`、
+  `install.mjs` 也列进识别名单**——不然早几版装过的人，那些指向已删文件的死钩子
+  会被当成「别人的钩子」永远留着，每次开 ZCode 都白跑一次。
 
-**边界**：装的时候必须**手动跑一次** `install-autostart.cmd`（或让 AI 做），
-因为往 ZCode 配置里写东西这件事本身没法自动完成。装完之后就再也不用管了。
-不想留钩子的话 `uninstall.cmd` 能干净还原——它只认自己写的那条，别的钩子不碰。
+**边界**：装的时候必须**手动执行一次**安装命令（或让 AI 做），因为往 ZCode 配置里
+写东西这件事本身没法自动完成。装完之后就再也不用管了。`--uninstall` 能干净还原。
+
+## 自己构建 exe
+
+```bash
+npm install --no-save esbuild postject
+node build/build-exe.mjs
+```
+
+产物在 `dist/opencode2zcode.exe`。**只有需要重新构建时才需要装这两个包**——
+它们是构建期依赖，对方拿到 exe 完全用不到。
 
 ## 致谢
 

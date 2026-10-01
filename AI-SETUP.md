@@ -18,29 +18,19 @@
 
 ## 1. 前置检查
 
-**先确认用户手上是哪种包**，这决定后面所有命令要不要带 `node`：
+**这个包只有一个文件：`opencode2zcode.exe`（2.0 MB，自包含）。**
+用户**不需要装 Node.js，也不需要装任何运行时**。
 
-| 包里有 | 用户需要 | 命令写法 |
-| --- | --- | --- |
-| `opencode2zcode.exe` | **什么都不用装** | `opencode2zcode.exe <参数>` |
-| 只有 `zen-proxy.mjs` | **Node.js 18+** | `node zen-proxy.mjs <参数>` |
-
-如果只有 `zen-proxy.mjs`：
+先确认它在：
 
 ```bash
-node --version
+dir opencode2zcode.exe
 ```
 
-需要 **Node 18 或更高**（用到内置 `fetch`）。没有就停下来，告诉用户：可以自己装
-Node.js，**或者向发布者要一个 `opencode2zcode.exe`**（单文件、零依赖，不需要装任何东西）。
-不要自行替用户安装系统级软件。
+找不到就停下来问用户要，别自己去找路径。
 
-记下本目录的绝对路径，后面叫它 `<PKG>`：
-
-```bash
-cd <这个文件所在的目录>
-pwd
-```
+> 如果用户拿到的是源码目录（里面有 `zen-proxy.mjs` 而不是 exe），那才需要
+> Node.js 18+。但正常分发只发 exe。
 
 ---
 
@@ -63,7 +53,7 @@ node -e "console.log(process.env.ZCODE_DATA_BASE_DIR || '(未设置)')"
 不要为此猜测或硬编码路径，用工具自己的探测：
 
 ```bash
-node zen-proxy.mjs --detect
+opencode2zcode.exe --detect
 ```
 
 **期望输出**（本机示例）：
@@ -102,7 +92,7 @@ ZCode 数据目录候选（✓ = 带 v2/runtime，即认得出来）：
 拿到路径后，后续所有命令都显式带上：
 
 ```bash
-node zen-proxy.mjs --config "<数据根>\.zcode\v2\provider_config.json" --write-config-only
+opencode2zcode.exe --config "<数据根>\.zcode\v2\provider_config.json" --write-config-only
 ```
 
 ---
@@ -110,7 +100,7 @@ node zen-proxy.mjs --config "<数据根>\.zcode\v2\provider_config.json" --write
 ## 3. 先看要写什么（不落盘）
 
 ```bash
-node zen-proxy.mjs --print-config
+opencode2zcode.exe --print-config
 ```
 
 这个模式**不落盘、不起服务**，而且会把**所有** provider 的 `apiKey` 换成
@@ -130,7 +120,7 @@ node zen-proxy.mjs --print-config
 ## 4. 正式写配置
 
 ```bash
-node zen-proxy.mjs --write-config-only
+opencode2zcode.exe --write-config-only
 ```
 
 **期望输出**：
@@ -183,13 +173,7 @@ ZCode 大约 **1 秒**轮询一次该文件。若设置页没刷新，让用户�
 
 前面几步只是把配置写好了，代理本身还没跑。这一步让它以后自动跑。
 
-**先看用户手上是哪种包**，两条命令任选其一，参数完全一样：
-
 ```bash
-# 源码包（用户有 Node.js 18+）
-node zen-proxy.mjs --install
-
-# 单文件 exe（用户没装 Node.js，零依赖）
 opencode2zcode.exe --install
 ```
 
@@ -224,7 +208,7 @@ opencode2zcode.exe --install
 装完立刻验证一次（不必等下次开 ZCode）：
 
 ```bash
-node zen-proxy.mjs --ensure        # exe 则是：opencode2zcode.exe --ensure
+opencode2zcode.exe opencode2zcode-hook
 curl http://127.0.0.1:41930/healthz
 ```
 
@@ -275,7 +259,7 @@ node selftest.mjs
 
 它用本地 mock 上游跑，**不打任何真实网络请求**，几秒出结果。覆盖免费判定、
 下架剔除、伪装头、体门禁、档位归一、Provider 增删的对称性。
-改动过 `zen-proxy.mjs` 之后建议跑一次再交付。
+改动过 `rust/src/` 之后建议跑一次再交付。
 
 ---
 
@@ -310,7 +294,7 @@ OpenCode Zen 的匿名免费档位接受一个公开占位符 `public` 作为凭
 | --- | --- |
 | 设置里没有「OpenCode 免费模型」 | 先看 `配置目标` 那行的括号内容，是不是「用户主目录兜底」；再看 `--detect` 的结论路径对不对 |
 | 有分组但一发消息就失败 | 代理没在跑。`curl http://127.0.0.1:41930/healthz` 确认。手动跑 `--ensure` 能拉起来就说明钩子没生效——重跑一次 `--install` |
-| 报 403 `FreeTierError` | 伪装头或请求体门禁没过，上游收紧了。改 `zen-proxy.mjs` 里的 `OPENCODE_CLIENT_VERSION` 跟官方 CLI 版本号 |
+| 报 403 `FreeTierError` | 伪装头或请求体门禁没过，上游收紧了。改 `rust/src/zen.rs` 里的 `OPENCODE_CLIENT_VERSION` 跟官方 CLI 版本号 |
 | 报 429 | 匿名通道按 IP 限速，等一会儿 |
 | 报 400 `invalid request` | 看代理 stderr 有没有「摘掉该字段重试」的日志；重试也失败说明这个模型当前不可用 |
 | 模型列表比预期少 | 看 `/healthz` 的 `catalog.status`，`static` = 还没联网成功，用的是内置兜底清单。目录里判定为「已下架」的模型会被有意剔掉，属正常 |
@@ -324,32 +308,38 @@ OpenCode Zen 的匿名免费档位接受一个公开占位符 `public` 作为凭
 ## 10. 命令速查
 
 ```bash
-node zen-proxy.mjs --install            # 装上「随 ZCode 自动启动」（幂等）
-node zen-proxy.mjs --uninstall          # 卸掉钩子 + 摘掉本工具的 Provider
-node zen-proxy.mjs --ensure             # 手动触发一次检查+拉起（无窗口）
-node zen-proxy.mjs --detect             # 看探测到的数据目录与判据
-node zen-proxy.mjs --print-config       # 看要写什么（apiKey 已脱敏，不落盘）
-node zen-proxy.mjs --write-config-only  # 只写配置后退出
-node zen-proxy.mjs --remove-provider    # 从 ZCode 配置里摘掉本工具的两个 Provider
-node zen-proxy.mjs                      # 前台起代理（调试用，窗口要开着）
-node zen-proxy.mjs --port 41931         # 换端口
-node zen-proxy.mjs --config <完整路径>   # 直接指定 provider_config.json
-node selftest.mjs                       # 自测（本地 mock，不打真实网络）
-node zen-proxy.mjs --help               # 全部参数
+opencode2zcode.exe --install            # 装上「随 ZCode 自动启动」（幂等）
+opencode2zcode.exe --uninstall          # 卸掉钩子 + 摘掉本工具的 Provider
+opencode2zcode.exe opencode2zcode-hook  # 手动触发一次检查+拉起（无窗口）
+opencode2zcode.exe --detect             # 看探测到的数据目录与判据
+opencode2zcode.exe --print-config       # 看要写什么（apiKey 已脱敏，不落盘）
+opencode2zcode.exe --write-config-only  # 只写配置后退出
+opencode2zcode.exe --remove-provider    # 从 ZCode 配置里摘掉本工具的两个 Provider
+opencode2zcode.exe                      # 前台起代理（调试用，窗口要开着）
+opencode2zcode.exe --port 41931         # 换端口
+opencode2zcode.exe --config <完整路径>   # 直接指定 provider_config.json
+opencode2zcode.exe --help               # 全部参数
+```
+
+如果用户手上是源码目录而不是 exe，把 `opencode2zcode.exe` 换成
+`node zen-proxy.mjs` 即可，参数完全一样（源码目录需要 Node.js 18+）。
+
 ```
 
 ## 11. 本包的文件
 
 ```
-zen-proxy.mjs          全部功能都在这一个文件里（代理 + 配置同步 + 自起停 + 静默拉起）
-install-autostart.cmd  双击这个 = 装上「随 ZCode 自动启动」（需要 Node.js）
-uninstall.cmd          双击这个 = 彻底还原
-start-zen-proxy.cmd    手动前台启动（调试用）
-selftest.mjs           自测，22 项
+opencode2zcode.exe     唯一要分发的文件（2.0 MB，自包含，零依赖）
 README.md              给人看的说明
 AI-SETUP.md            本文件，给 AI 看的安装说明
+```
 
-opencode2zcode.exe     单文件版（如果对方没装 Node.js 就给这个，零依赖）
+装了 Node.js 18+ 的话还能拿到源码与测试：
+
+```
+zen-proxy.mjs          等价的 Node 实现（行为基准）
+selftest.mjs           Node 版自测，22 项
+rust/                  Rust 源码与测试
 ```
 
 **不要**把 `zcode-data-dir.txt` 拷到别的电脑——它记录的是源机器上的数据目录。
@@ -388,4 +378,4 @@ const isFree = (provider, cost) => provider === "opencode" && (!cost || cost.inp
 只看 `input` 不看 `output`，且「没有 cost 数据」也算免费；
 Zen 会把下架模型留在公开清单里而标价仍是 0，不排除的话模型选择器里会出现
 点下去必报错的选项。目录里标称免费的有 34 个，过滤后剩 8 个，与桌面版完全相同。
-`selftest.mjs` 里有针对这一条的回归测试。
+`rust/src/catalog.rs` 的单元测试里有针对这一条的回归。

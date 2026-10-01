@@ -1,0 +1,674 @@
+//! 模型目录：S1（Zen 实时清单）∩ S2（models.dev 判为免费且未下架）。
+//!
+//! 「免费」的判定与 OpenCode 桌面版逐位对齐，规则和理由见 `decide` 的注释。
+
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+use crate::zen::{opencode_user_agent, ACCEPTED_EFFORT_LADDER, ANONYMOUS_KEY};
+
+/// 断网兜底清单：2026-10-01 对 models.dev 实时核对，等于桌面版当前那 8 个
+/// 「免费且未下架」的模型。联网成功后由实时目录取代。
+pub const STATIC_FREE_MODELS: [&str; 8] = [
+    "big-pickle",
+    "ling-3.0-flash-fin-free",
+    "longcat-2.5-preview-free",
+    "mimo-v2.6-flash-free",
+    "muse-spark-1.3-contributor-free",
+    "nemotron-3-ultra-free",
+    "nemotron-3.5-lightning-free",
+    "space-bunny-free",
+];
+
+pub const DEFAULT_EFFORT_LADDER: [&str; 4] = ["minimal", "low", "medium", "high"];
+
+const CACHE_TTL_MS: u128 = 7 * 24 * 60 * 60 * 1000;
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
+const STALE_AFTER_MS: u128 = 10 * 60 * 1000;
+
+#[derive(Clone, Debug, Default)]
+pub struct Price {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub deprecated: bool,
+    pub reasoning: bool,
+    pub context_window: f64,
+    pub max_tokens: f64,
+    pub modalities_input: Vec<String>,
+    pub effort_values: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Decision {
+    pub allowed: bool,
+    pub source: &'static str,
+    pub known: bool,
+}
+
+impl Decision {
+    fn deny(source: &'static str, known: bool) -> Self {
+        Self { allowed: false, source, known }
+    }
+    fn allow(source: &'static str, known: bool) -> Self {
+        Self { allowed: true, source, known }
+    }
+}
+
+fn is_free_model(model: &str) -> bool {
+    model.to_lowercase().contains("free")
+}
+
+/// models.dev 的 opencode 段 → modelId → 元数据。
+pub fn decode_models_dev(data: &Value) -> BTreeMap<String, Price> {
+    let mut result = BTreeMap::new();
+    // 供应商可能裹在 `providers` 下，也可能直接摊在根上——models.dev 两种形状
+    // 都出现过。只认一种会让整个元数据判定静默失效（prices_ready 永远为 false），
+    // 于是所有名字里带 free 的模型都被放行，下架的也混进来。
+    let providers = data
+        .get("providers")
+        .filter(|v| v.is_object())
+        .unwrap_or(data);
+    let Some(providers) = providers.as_object() else {
+        return result;
+    };
+
+    // 优先精确的 opencode 段，其次名字里带 opencode 的段，都不像才放弃。
+    let mut keys: Vec<&String> = providers.keys().collect();
+    let rank = |k: &str| -> u8 {
+        let lower = k.to_lowercase();
+        if lower == "opencode" || lower == "opencode-zen" || lower == "opencode_zen" {
+            0
+        } else if lower.contains("opencode") {
+            1
+        } else {
+            2
+        }
+    };
+    keys.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+
+    for key in keys {
+        if rank(key) > 1 {
+            continue;
+        }
+        let Some(provider) = providers.get(key.as_str()) else { continue };
+        if rank(key) == 1 {
+            let identity = format!(
+                "{} {}",
+                provider.get("id").and_then(Value::as_str).unwrap_or(""),
+                provider.get("name").and_then(Value::as_str).unwrap_or("")
+            )
+            .to_lowercase();
+            if !identity.contains("opencode") {
+                continue;
+            }
+        }
+        let Some(models) = provider.get("models").and_then(Value::as_object) else { continue };
+        for (model_key, raw) in models {
+            if !raw.is_object() {
+                continue;
+            }
+            let model_id = raw
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(model_key.as_str())
+                .to_string();
+            let cost = raw.get("cost");
+            let limit = raw.get("limit");
+            let num = |v: Option<&Value>| -> Option<f64> {
+                v.and_then(Value::as_f64).filter(|f| f.is_finite())
+            };
+            let modalities_input: Vec<String> = raw
+                .get("modalities")
+                .and_then(|m| m.get("input"))
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+
+            result.insert(
+                model_id,
+                Price {
+                    input: num(cost.and_then(|c| c.get("input"))),
+                    output: num(cost.and_then(|c| c.get("output"))),
+                    deprecated: metadata_deprecated(raw),
+                    reasoning: raw.get("reasoning").and_then(Value::as_bool) == Some(true),
+                    context_window: num(limit.and_then(|l| l.get("context"))).unwrap_or(262144.0),
+                    max_tokens: num(limit.and_then(|l| l.get("output"))).unwrap_or(32768.0),
+                    modalities_input,
+                    effort_values: decode_effort_values(raw.get("reasoning_options")),
+                },
+            );
+        }
+        if !result.is_empty() {
+            return result;
+        }
+    }
+    result
+}
+
+fn metadata_deprecated(model: &Value) -> bool {
+    if model.get("deprecated").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let status = model
+        .get("status")
+        .or_else(|| model.get("lifecycle"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_lowercase();
+    if matches!(status.as_str(), "deprecated" | "retired" | "disabled") {
+        return true;
+    }
+    model.get("deprecated_at").map(|v| !v.is_null()).unwrap_or(false)
+        || model.get("retirement_date").map(|v| !v.is_null()).unwrap_or(false)
+}
+
+fn decode_effort_values(raw: Option<&Value>) -> Vec<String> {
+    let Some(Value::Array(options)) = raw else {
+        return Vec::new();
+    };
+    let mut values = Vec::new();
+    for option in options {
+        let Some(obj) = option.as_object() else { continue };
+        if obj.get("type").and_then(Value::as_str) != Some("effort") {
+            continue;
+        }
+        let Some(Value::Array(vals)) = obj.get("values") else { continue };
+        for value in vals {
+            if let Some(s) = value.as_str().filter(|s| !s.is_empty()) {
+                if !values.iter().any(|v: &String| v == s) {
+                    values.push(s.to_string());
+                }
+            }
+        }
+    }
+    values
+}
+
+/// 从 models.dev 的 reasoning_options 推出 UI 档位阶梯（去掉上游不收的 off/none）。
+pub fn efforts_for(price: Option<&Price>) -> Vec<String> {
+    let Some(price) = price else { return Vec::new() };
+    if !price.reasoning {
+        return Vec::new();
+    }
+    let mut declared: Vec<String> = Vec::new();
+    for value in &price.effort_values {
+        let level = if value == "none" { "off" } else { value.as_str() };
+        if ACCEPTED_EFFORT_LADDER.contains(&level) && !declared.iter().any(|d| d == level) {
+            declared.push(level.to_string());
+        }
+    }
+    if declared.is_empty() {
+        return DEFAULT_EFFORT_LADDER.iter().map(|s| s.to_string()).collect();
+    }
+    declared.sort_by_key(|level| {
+        ACCEPTED_EFFORT_LADDER.iter().position(|l| l == level).unwrap_or(usize::MAX)
+    });
+    declared
+}
+
+/// 是否免费——与 OpenCode 桌面版逐位对齐。桌面版的判定就一行
+/// （packages/app/src/components/dialog-select-model.tsx）：
+///
+///   isFree = provider === "opencode" && (!cost || cost.input === 0)
+///
+/// 两处容易踩的细节：
+///   1. 只看 input，**不看 output**；并且「没有 cost 数据」也算免费。
+///   2. 桌面版还会排除 status 为 deprecated 的条目。Zen 把下架模型留在公开
+///      /models 和目录里（标价仍是 0），不排除的话模型选择器里会出现点下去
+///      必报错的选项——实测 mimo-v2.5-free、muse-spark-1.2-contributor-free
+///      就是这样被误放进来的。
+pub fn decide(model: &str, prices: &BTreeMap<String, Price>, ready: bool) -> Decision {
+    let name_free = is_free_model(model);
+    let fallback = |source: &'static str| -> Decision {
+        if name_free {
+            Decision::allow("name_free", false)
+        } else {
+            Decision::deny(source, false)
+        }
+    };
+    if !ready || prices.is_empty() {
+        return fallback("metadata_pending");
+    }
+    let Some(price) = prices.get(model) else {
+        return fallback("metadata_model_missing");
+    };
+    // 废弃是硬否决，后面的兜底也不许把它捞回来。
+    if price.deprecated {
+        return Decision::deny("metadata_deprecated", true);
+    }
+    if price.input.is_none() || price.input == Some(0.0) {
+        return Decision::allow(
+            if name_free { "name_and_metadata_free" } else { "metadata_free" },
+            true,
+        );
+    }
+    Decision::deny("metadata_paid", true)
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Snapshot {
+    pub status: &'static str,
+    pub source: &'static str,
+    pub total: usize,
+    pub exposed: usize,
+    pub last_error: String,
+}
+
+pub struct ModelCatalog {
+    cache_path: Option<PathBuf>,
+    zen: BTreeSet<String>,
+    prices: BTreeMap<String, Price>,
+    prices_ready: bool,
+    updated_at_ms: u128,
+    live_at_ms: u128,
+    last_error: String,
+    seeded: bool,
+    cached_fingerprint: String,
+    last_change_key: String,
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+impl ModelCatalog {
+    pub fn new(cache_path: Option<PathBuf>) -> Self {
+        Self {
+            cache_path,
+            zen: BTreeSet::new(),
+            prices: BTreeMap::new(),
+            prices_ready: false,
+            updated_at_ms: 0,
+            live_at_ms: 0,
+            last_error: String::new(),
+            seeded: false,
+            cached_fingerprint: String::new(),
+            last_change_key: String::new(),
+        }
+    }
+
+    fn seed_from_cache(&mut self) {
+        if self.seeded {
+            return;
+        }
+        self.seeded = true;
+        let Some(path) = &self.cache_path else { return };
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let Ok(raw) = serde_json::from_str::<Value>(&text) else { return };
+        if raw.get("version").and_then(Value::as_u64) != Some(1) {
+            return;
+        }
+        let Some(updated_at) = raw.get("updatedAt").and_then(Value::as_f64) else { return };
+        let updated_at = updated_at as u128;
+        if now_ms().saturating_sub(updated_at) > CACHE_TTL_MS {
+            return;
+        }
+        if let Some(ids) = raw.get("zen").and_then(Value::as_array) {
+            let list: Vec<String> = ids
+                .iter()
+                .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(String::from))
+                .collect();
+            if !list.is_empty() {
+                self.zen = list.into_iter().collect();
+                self.updated_at_ms = updated_at;
+            }
+        }
+        if let Some(entries) = raw.get("prices").and_then(Value::as_array) {
+            let mut map = BTreeMap::new();
+            for entry in entries {
+                let Some(pair) = entry.as_array() else { continue };
+                if pair.len() != 2 {
+                    continue;
+                }
+                let (Some(k), Some(v)) = (pair[0].as_str(), pair[1].as_object()) else { continue };
+                if let Some(price) = price_from_value(v) {
+                    map.insert(k.to_string(), price);
+                }
+            }
+            if !map.is_empty() {
+                self.prices = map;
+                self.prices_ready = true;
+            }
+        }
+        self.cached_fingerprint = self.fingerprint();
+    }
+
+    fn fingerprint(&self) -> String {
+        serde_json::to_string(&(
+            &self.zen,
+            self.prices
+                .iter()
+                .map(|(k, v)| (k, price_to_value(v)))
+                .collect::<Vec<_>>(),
+        ))
+        .unwrap_or_default()
+    }
+
+    fn save_cache(&mut self) {
+        let Some(path) = self.cache_path.clone() else { return };
+        if self.zen.is_empty() && self.prices.is_empty() {
+            return;
+        }
+        let fingerprint = self.fingerprint();
+        if !self.cached_fingerprint.is_empty() && self.cached_fingerprint == fingerprint {
+            return;
+        }
+        let payload = serde_json::json!({
+            "version": 1,
+            "updatedAt": now_ms(),
+            "zen": self.zen.iter().cloned().collect::<Vec<_>>(),
+            "prices": self
+                .prices
+                .iter()
+                .map(|(k, v)| (k.clone(), price_to_value(v)))
+                .collect::<Vec<_>>(),
+        });
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        if std::fs::write(&temporary, serde_json::to_string(&payload).unwrap_or_default()).is_ok() {
+            if std::fs::rename(&temporary, &path).is_ok() {
+                self.cached_fingerprint = fingerprint;
+            } else {
+                let _ = std::fs::remove_file(&temporary);
+            }
+        }
+    }
+
+    /// 拉一次实时目录。返回暴露清单是否发生了变化。
+    pub fn refresh_once(&mut self, zen_base_url: &str) -> bool {
+        self.seed_from_cache();
+        self.refresh_zen(zen_base_url);
+        self.refresh_metadata();
+        self.save_cache();
+
+        let key = self.list().join("|");
+        let changed = key != self.last_change_key;
+        self.last_change_key = key;
+        changed
+    }
+
+    /// 首次播种不算「变化」，避免还没联网就先写一版缩水配置。
+    pub fn prime(&mut self, zen_base_url: &str) {
+        self.refresh_once(zen_base_url);
+        self.last_change_key = self.list().join("|");
+    }
+
+    fn refresh_zen(&mut self, zen_base_url: &str) {
+        let client = match crate::http::client() {
+            Ok(c) => c,
+            Err(e) => {
+                self.last_error = e;
+                return;
+            }
+        };
+        let url = format!("{zen_base_url}/v1/models");
+        let mut request = client.get(&url).header("authorization", format!("Bearer {ANONYMOUS_KEY}"));
+        request = request.header("user-agent", opencode_user_agent());
+        request = request.header("x-opencode-client", "cli");
+        request = request.header("accept", "application/json");
+        match request.timeout(CATALOG_TIMEOUT).send() {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<Value>() {
+                    Ok(payload) => {
+                        let ids: BTreeSet<String> = payload
+                            .get("data")
+                            .and_then(Value::as_array)
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        self.zen = ids;
+                        let now = now_ms();
+                        self.updated_at_ms = now;
+                        self.live_at_ms = now;
+                        self.last_error.clear();
+                    }
+                    Err(e) => self.last_error = e.to_string(),
+                }
+            }
+            Ok(response) => {
+                self.last_error = format!("models endpoint returned HTTP {}", response.status());
+            }
+            Err(e) => self.last_error = e.to_string(),
+        }
+    }
+
+    fn refresh_metadata(&mut self) {
+        let client = match crate::http::client() {
+            Ok(c) => c,
+            Err(e) => {
+                if !self.prices_ready {
+                    self.last_error = e;
+                }
+                return;
+            }
+        };
+        let result: Result<Value, String> = (|| {
+            let response = client
+                .get(crate::METADATA_URL)
+                .header("accept", "application/json")
+                .timeout(CATALOG_TIMEOUT)
+                .send()
+                .map_err(|e| e.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!("models.dev returned HTTP {}", response.status()));
+            }
+            response.json::<Value>().map_err(|e| e.to_string())
+        })();
+        match result {
+            Ok(data) => {
+                let prices = decode_models_dev(&data);
+                if prices.is_empty() {
+                    if !self.prices_ready {
+                        self.last_error = "models.dev contains no OpenCode model metadata".into();
+                    }
+                } else {
+                    self.prices = prices;
+                    self.prices_ready = true;
+                    self.live_at_ms = now_ms();
+                }
+            }
+            Err(e) => {
+                if !self.prices_ready {
+                    self.last_error = e;
+                }
+            }
+        }
+    }
+
+    pub fn decision_for(&self, model: &str) -> Decision {
+        let metadata = decide(model, &self.prices, self.prices_ready);
+        if metadata.allowed {
+            return metadata;
+        }
+        // 目录已明确判定废弃时，S3 静态清单不再把它捞回来——那正是早先多出
+        // mimo-v2.5-free / muse-spark-1.2-contributor-free 的原因。S3 只兜「还说不准」。
+        if metadata.source == "metadata_deprecated" {
+            return metadata;
+        }
+        if !metadata.known && STATIC_FREE_MODELS.contains(&model) {
+            return Decision::allow("static_verified", false);
+        }
+        metadata
+    }
+
+    /// 暴露的 id：S1 ∩ 允许；S1 还没到时用静态实测清单。
+    pub fn list(&self) -> Vec<String> {
+        if self.zen.is_empty() {
+            let mut out: Vec<String> = STATIC_FREE_MODELS.iter().map(|s| s.to_string()).collect();
+            out.sort();
+            return out;
+        }
+        let mut out: Vec<String> = self
+            .zen
+            .iter()
+            .filter(|m| self.decision_for(m).allowed)
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
+
+    pub fn metadata(&self, model: &str) -> Option<&Price> {
+        self.prices.get(model)
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        let age = now_ms().saturating_sub(self.updated_at_ms);
+        let stale = self.updated_at_ms != 0 && age > STALE_AFTER_MS;
+        Snapshot {
+            status: if self.updated_at_ms == 0 {
+                "pending"
+            } else if stale {
+                "stale"
+            } else {
+                "ready"
+            },
+            source: if self.live_at_ms != 0 {
+                "live"
+            } else if self.updated_at_ms != 0 {
+                "cache"
+            } else {
+                "static"
+            },
+            total: self.zen.len(),
+            exposed: self.list().len(),
+            last_error: self.last_error.clone(),
+        }
+    }
+
+    pub fn cache_path(&self) -> Option<&Path> {
+        self.cache_path.as_deref()
+    }
+
+    /// 仅供测试注入：构造一份「目录数据已知」的状态，避免单测去打真实网络。
+    #[cfg(test)]
+    pub fn with_prices(prices: BTreeMap<String, Price>, zen: BTreeSet<String>) -> Self {
+        let mut catalog = Self::new(None);
+        catalog.prices = prices;
+        catalog.prices_ready = true;
+        catalog.zen = zen;
+        catalog
+    }
+}
+
+fn price_to_value(p: &Price) -> Value {
+    serde_json::json!({
+        "input": p.input,
+        "output": p.output,
+        "deprecated": p.deprecated,
+        "reasoning": p.reasoning,
+        "contextWindow": p.context_window,
+        "maxTokens": p.max_tokens,
+        "modalitiesInput": p.modalities_input,
+        "effortValues": p.effort_values,
+    })
+}
+
+fn price_from_value(v: &serde_json::Map<String, Value>) -> Option<Price> {
+    Some(Price {
+        input: v.get("input").and_then(Value::as_f64),
+        output: v.get("output").and_then(Value::as_f64),
+        deprecated: v.get("deprecated").and_then(Value::as_bool).unwrap_or(false),
+        reasoning: v.get("reasoning").and_then(Value::as_bool).unwrap_or(false),
+        context_window: v.get("contextWindow").and_then(Value::as_f64).unwrap_or(262144.0),
+        max_tokens: v.get("maxTokens").and_then(Value::as_f64).unwrap_or(32768.0),
+        modalities_input: v
+            .get("modalitiesInput")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+        effort_values: v
+            .get("effortValues")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn price(input: Option<f64>, deprecated: bool) -> Price {
+        Price {
+            input,
+            output: Some(0.0),
+            deprecated,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn 免费判定对齐桌面版() {
+        let mut prices = BTreeMap::new();
+        // 桌面版：!cost || cost.input === 0
+        prices.insert("no-cost-data".to_string(), price(None, false));
+        prices.insert("zero-input".to_string(), price(Some(0.0), false));
+        // 只看 input，不看 output：output 非 0 也算免费
+        prices.insert(
+            "input0-output-priced".to_string(),
+            Price { input: Some(0.0), output: Some(3.0), ..Default::default() },
+        );
+        prices.insert("paid".to_string(), price(Some(1.4), false));
+        prices.insert("dead".to_string(), price(Some(0.0), true));
+
+        for id in ["no-cost-data", "zero-input", "input0-output-priced"] {
+            assert!(decide(id, &prices, true).allowed, "{id} 应判免费");
+        }
+        assert!(!decide("paid", &prices, true).allowed, "有价的不该判免费");
+        // 回归：已下架的 mimo-v2.5-free 曾被误放进清单
+        assert_eq!(decide("dead", &prices, true).source, "metadata_deprecated");
+        assert!(!decide("dead", &prices, true).allowed, "下架模型必须硬否决");
+    }
+
+    #[test]
+    fn 目录判定废弃时静态兜底不许复活它() {
+        let mut catalog = ModelCatalog::new(None);
+        let mut prices = BTreeMap::new();
+        prices.insert("mimo-v2.5-free".to_string(), price(Some(0.0), true));
+        prices.insert("muse-spark-1.2-contributor-free".to_string(), price(Some(0.0), true));
+        catalog.prices = prices;
+        catalog.prices_ready = true;
+        catalog.zen = ["mimo-v2.5-free", "muse-spark-1.2-contributor-free", "big-pickle"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let list = catalog.list();
+        assert!(!list.contains(&"mimo-v2.5-free".to_string()), "下架的不该复活");
+        assert!(
+            !list.contains(&"muse-spark-1.2-contributor-free".to_string()),
+            "下架的不该复活"
+        );
+        assert!(list.contains(&"big-pickle".to_string()), "在架的应保留");
+    }
+
+    #[test]
+    fn 没有实时清单时退回静态清单() {
+        let catalog = ModelCatalog::new(None);
+        assert_eq!(catalog.list().len(), STATIC_FREE_MODELS.len());
+    }
+
+    #[test]
+    fn 档位阶梯去掉上游不收的档位() {
+        let p = Price {
+            reasoning: true,
+            effort_values: vec!["none".into(), "low".into(), "high".into(), "max".into(), "bogus".into()],
+            ..Default::default()
+        };
+        assert_eq!(efforts_for(Some(&p)), vec!["low", "high", "max"]);
+        // 不支持推理的模型没有档位
+        assert!(efforts_for(Some(&Price::default())).is_empty());
+        // 声明为空时给默认阶梯
+        let empty = Price { reasoning: true, ..Default::default() };
+        assert_eq!(efforts_for(Some(&empty)).len(), DEFAULT_EFFORT_LADDER.len());
+    }
+}

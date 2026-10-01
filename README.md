@@ -45,32 +45,36 @@ skills / commands / hooks / mcpServers
 
 ## 用法
 
-有**两种分发形式**，按对方机器上有没有 Node.js 选一个：
+**下载 `opencode2zcode.exe` 这一个文件就够了**——2.0 MB，自包含，**对方不需要装
+任何东西**（不用 Node.js、不用配环境变量、不用改 PATH）。
 
-| 形式 | 对方需要装什么 | 怎么用 |
-| --- | --- | --- |
-| **单文件 `opencode2zcode.exe`** | **什么都不用装** | 拷这一个文件过去，双击或命令行跑 |
-| 源码包（本目录） | Node.js 18+ | 解压后双击 `install-autostart.cmd` |
+装一次，之后再也不用管：
 
-两种形式**跑的是同一份源码**——exe 是用 esbuild + Node 官方 SEA 机制从
-`zen-proxy.mjs` 构建出来的，不存在「exe 版和脚本版行为不一样」的问题。
-
-### 装一次，之后就不用管了（推荐）
-
-```bash
-# 有 Node.js：
-install-autostart.cmd
-# 或没有 Node.js：
+```
 opencode2zcode.exe --install
 ```
 
-就这一步。它往 ZCode 的 CLI 配置里写一条 `SessionStart` 钩子，之后**每次启动 ZCode
-都会自动把代理拉起来**——**没有黑窗口，不用双击，不用记着开**。装完直接去
+它往 ZCode 的 CLI 配置里写一条 `SessionStart` 钩子，之后**每次启动 ZCode 都会
+自动把代理拉起来**——**没有黑窗口，不用双击，不用记着开**。装完直接去
 ZCode 的 **设置 → 模型服务** 看「OpenCode 免费模型」分组。
 
-想彻底还原，双击 `uninstall.cmd`（或 `opencode2zcode.exe --uninstall`）：它会删掉那条
-钩子、并把本工具的两个 Provider 从你的个人配置里摘掉，你的其它 Provider 和其它
-钩子一个字都不动。
+想彻底还原：
+
+```
+opencode2zcode.exe --uninstall
+```
+
+会删掉那条钩子、并把本工具的两个 Provider 从你的个人配置里摘掉，你的其它
+Provider 和其它钩子一个字都不动。
+
+<details>
+<summary>源码包（想自己改代码 / 想看实现）</summary>
+
+`rust/` 是 Rust 源码，`cargo build --release` 产出同一个 exe。
+仓库里还留着等价的 Node 实现 `zen-proxy.mjs`（需要 Node 18+），它既是
+Rust 版的对照物，也是重写时的行为基准。两者由对拍测试保证输出一致。
+
+</details>
 
 <details>
 <summary>不想装自启，手动跑（调试用）</summary>
@@ -86,7 +90,7 @@ opencode2zcode.exe        # 同上，exe 形态
 
 ### 命令
 
-两种形式参数完全一样：
+```
 
 ```bash
 --install            装上「随 ZCode 自动启动」（幂等，推荐）
@@ -323,40 +327,40 @@ node selftest.mjs                          -> 22/22 通过（本地 mock，不�
 ## 文件
 
 ```
-zen-proxy.mjs          全部功能都在这一个文件里，无外部依赖
-                       （代理 + 配置同步 + 自启钩子的装/卸 + 静默拉起）
-install-autostart.cmd  双击这个 = 装上「随 ZCode 自动启动」（需要 Node.js）
-uninstall.cmd          双击这个 = 彻底还原（钩子 + Provider 一起清）
-start-zen-proxy.cmd    手动前台启动（调试用，窗口要开着）
-selftest.mjs           自测：本地 mock 上游，22 项，不打真实网络
-README.md              本文件，给人看的说明
-AI-SETUP.md            给 AI 助手看的安装说明（拿到包的是 AI 时先读那份）
+bin/opencode2zcode.exe  唯一要分发的文件（2.0 MB，自包含，对方零依赖）
+README.md               本文件，给人看的说明
+AI-SETUP.md             给 AI 助手看的安装说明（拿到包的是 AI 时先读那份）
 
-build/build-exe.mjs    构建脚本：从 zen-proxy.mjs 打出单文件 exe
-dist/opencode2zcode.exe 构建产物（不入库），对方零依赖直接用
+rust/                   Rust 源码（cargo build --release 产出上面那个 exe）
+  src/zen.rs              伪装头、会话 id、免费通道门禁、思考档位归一
+  src/catalog.rs          模型目录与「免费」判定
+  src/zcode.rs            ZCode 个人 Provider 配置的合并/写入/摘除
+  src/detect.rs           ZCode 数据目录探测
+  src/autostart.rs        自启钩子的装/卸 + 静默拉起
+  src/proxy.rs            回环服务与 SSE 透传
+  tests/cli-parity.mjs    Node 版 vs Rust 版对拍
+  tests/live-mock.mjs     端到端（本地 mock 上游）
 
-zcode-data-dir.txt     运行后自动生成，记录探测到的数据根；不要拷到别的电脑
+zen-proxy.mjs           等价的 Node 实现，留作行为基准与对照（需 Node 18+）
+selftest.mjs            Node 版自测，22 项
+
+zcode-data-dir.txt      运行后自动生成，记录探测到的数据根；不要拷到别的电脑
 ```
 
 ## 拿到别人的电脑上用
 
-### 不想让对方装 Node.js（推荐）
+**只需要 `opencode2zcode.exe` 一个文件（2.0 MB）。** 微信、邮件、U 盘随手发都行。
 
-发 **`opencode2zcode.exe`** 这一个文件过去（87 MB，里面含 node 运行时）。
-对方把它放哪都行，然后：
+对方把它放哪都行，然后跑一条命令：
 
 ```
 opencode2zcode.exe --install
 ```
 
-一条命令搞定，**不用装任何东西、不用配环境变量**。装完启动 ZCode 就自动生效。
+完事。**不用装 Node.js、不用装任何运行时、不用配环境变量。**
 
-### 想发小包
-
-发整个目录或 zip（不含 exe，约 50 KB），对方需要 **Node.js 18+**，
-双击 `install-autostart.cmd` 即可。
-
-两种形式**同一份源码**，行为一致。包里**不含任何机器专属路径**——数据目录靠自动探测。
+包里不含任何机器专属路径——ZCode 的数据目录靠自动探测（扫各固定盘的
+`{数据根}/.zcode/v2/runtime` 指纹），所以跨机器直接可用。
 
 ### 让对方的 AI 来装
 
@@ -410,15 +414,29 @@ exe 形态下 `command` 直接是那个 exe。
 **边界**：装的时候必须**手动执行一次**安装命令（或让 AI 做），因为往 ZCode 配置里
 写东西这件事本身没法自动完成。装完之后就再也不用管了。`--uninstall` 能干净还原。
 
-## 自己构建 exe
+## 自己构建
 
 ```bash
-npm install --no-save esbuild postject
-node build/build-exe.mjs
+cd rust
+cargo build --release
+# 产物：rust/target/release/opencode2zcode.exe
 ```
 
-产物在 `dist/opencode2zcode.exe`。**只有需要重新构建时才需要装这两个包**——
-它们是构建期依赖，对方拿到 exe 完全用不到。
+构建期只需要 Rust 工具链。**对方拿到 exe 完全用不到任何构建工具。**
+
+## 测试
+
+```bash
+cd rust && cargo test              # 25 项单元测试
+node rust/tests/cli-parity.mjs     # 16 项：Node 版 vs Rust 版对拍
+node rust/tests/live-mock.mjs      # 20 项：端到端（本地 mock 上游）
+node selftest.mjs                  # 22 项：Node 版自测
+```
+
+**对拍测试是这个项目的安全网。** 重写最容易出的错是「一边改了另一边没改」——
+比如 models.dev 的返回形状（供应商有时裹在 `providers` 下、有时直接摊在根上），
+只认一种会让整个元数据判定静默失效，然后所有名字带 `free` 的模型都被放行，
+下架的也混进来。对拍把两个实现放在同一组断言下跑，任何一边跑偏都会被抓到。
 
 ## 致谢
 

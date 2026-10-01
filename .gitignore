@@ -8,3 +8,4 @@ node_modules/
 dist/
 build/bundle.cjs
 build/sea-prep.blob
+rust/target/

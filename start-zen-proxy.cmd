@@ -21,8 +21,12 @@ rem set "ZCODE_DATA_BASE_DIR=D:\Program"
 rem -------------------------------------------------------------------------
 
 where node >nul 2>nul || goto :nonode
-echo opencode2zcode - starting loopback proxy
-echo Close this window to stop the proxy.
+echo opencode2zcode - starting loopback proxy (foreground, for debugging)
+echo.
+echo   This window must stay open; closing it stops the proxy.
+echo   For normal use, run install-autostart.cmd once instead - ZCode then
+echo   starts the proxy silently and you never see a window again.
+echo.
 echo Default port 41930. Health check: curl http://127.0.0.1:41930/healthz
 echo Run with --help to see all options.
 echo.

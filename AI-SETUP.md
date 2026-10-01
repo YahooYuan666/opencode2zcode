@@ -1,14 +1,16 @@
 # AI-SETUP.md —— 给 AI 助手的安装说明
 
 > 这份文件是写给**在目标电脑上工作的 AI 助手**的，不是写给人的。
-> 人类用户只需要知道最后那两步（见第 7 节）。请按顺序执行，每步都要看实际输出再往下走。
+> 人类用户只需要知道最后那一步（见第 7 节）。请按顺序执行，每步都要看实际输出再往下走。
 
 ---
 
 ## 0. 你要做的事，用一句话说
 
-把一个本地回环代理跑起来，并让 **ZCode** 的「个人 Provider 配置」多出一组名为
-**OpenCode 免费模型**的服务。ZCode 每秒轮询该配置文件，所以写完不需要重启 ZCode。
+把一个本地回环代理装成**随 ZCode 自动启动**，并让 **ZCode** 的「个人 Provider 配置」
+多出一组名为 **OpenCode 免费模型**的服务。ZCode 每秒轮询该配置文件，所以写完不需要重启。
+
+装完之后：**用户再也不用管，也永远看不见黑窗口**——启动 ZCode 时自动拉起。
 
 **先读第 8 节的风险说明，再决定要不要继续。**
 
@@ -125,8 +127,12 @@ node zen-proxy.mjs --write-config-only
 ```
 [zen] 配置目标（自动探测）：<数据根>\.zcode\v2\provider_config.json
 已写入 <数据根>\.zcode\v2\provider_config.json
-chat 8 个模型 / responses 2 个模型
+chat 7 个模型 / responses 1 个模型
 ```
+
+> 期望是 **7 + 1 = 8 个**。这 8 个与 OpenCode 桌面版当前列出的免费模型**完全一致**。
+> 数字对不上通常意味着目录刷新没成功（`catalog.source` 不是 `live`），
+> 或者上游在变——先跑 `--detect` 和 `/healthz` 确认，不要硬凑。
 
 检查这几行：
 
@@ -162,31 +168,52 @@ ZCode 大约 **1 秒**轮询一次该文件。若设置页没刷新，让用户�
 
 ---
 
-## 6. 让代理跑起来（可选但推荐，用来验证链路）
+## 6. 装上「随 ZCode 自动启动」（核心步骤）
 
-双击 `start-zen-proxy.cmd`，或：
+前面几步只是把配置写好了，代理本身还没跑。这一步让它以后自动跑。
 
 ```bash
-node zen-proxy.mjs
+node install.mjs
+```
+
+**期望输出**：
+
+```
+[install] 已写入 SessionStart 钩子：C:\Users\<用户>\.zcode\cli\config.json
+[install] 钩子命令：<node 的绝对路径> <PKG>\ensure-proxy.mjs
+[install] 从现在起，启动 ZCode 会自动静默拉起代理，不用再双击任何东西。
+```
+
+如果第一行显示「自启钩子已经在位」，说明装过了，跳过即可——**这个命令是幂等的**。
+
+它做了什么：往 ZCode 的 CLI 配置里加一条 `SessionStart` 钩子，指向本目录的
+`ensure-proxy.mjs`。那个脚本在 ZCode 启动时检查代理在不在，不在就**静默**拉起
+（`detached` + `windowsHide`，不弹窗口），并最多等 6 秒；无论成败退出码恒为 0，
+不会影响 ZCode 开会话。
+
+> **这一步会修改 ZCode 的配置文件。** 动手前告诉用户你要改什么；
+> `install.mjs` 会自动在同目录留一份 `config.json.bak-<时间戳>`。
+> 用户的其它 `mcp` / `plugins` 配置不会被碰。
+
+装完立刻验证一次（不必等下次开 ZCode）：
+
+```bash
+node ensure-proxy.mjs
+curl http://127.0.0.1:41930/healthz
 ```
 
 **期望输出**：
 
 ```
 [zen] 回环代理已监听 127.0.0.1:41930
-[zen] 配置目标（...）：<数据根>\.zcode\v2\provider_config.json
 [zen] 已同步 ZCode 配置：<数据根>\.zcode\v2\provider_config.json
-[zen] chat 8 个 / responses 2 个模型
+[zen] chat 7 个 / responses 1 个模型
 ```
 
-然后验证：
+然后 `curl` 应回 `"ok":true` 且 `catalog.source` 为 `live`
+（`static` 表示还没联网成功，用内置兜底清单，仍可用）。
 
-```bash
-curl http://127.0.0.1:41930/healthz
-```
-
-期望 `"ok":true`，且 `catalog.source` 是 `live`（`static` 表示还没联网成功，
-用内置兜底清单，仍可用）。再发一条真实对话：
+再发一条真实对话确认整条链路：
 
 ```bash
 curl -s -X POST http://127.0.0.1:41930/v1/chat/completions \
@@ -196,19 +223,33 @@ curl -s -X POST http://127.0.0.1:41930/v1/chat/completions \
 
 期望返回 SSE 流（`data: {"id":...` 开头）。能返回就说明整条链路通了。
 
-**这个进程是常驻的**——用户关掉那个窗口，代理就停了，模型也就不能用了。
-所以第 7 节要提醒用户「别关窗口」。
+**这个代理进程是常驻的**，但用户**不需要看见它、也不需要留着任何窗口**。
+关掉 ZCode 不影响它，下次开 ZCode 时钩子会发现它还在、什么都不做。
 
 ---
 
-## 7. 告诉用户的两步（用大白话，不要讲术语）
+## 7. 告诉用户的一句话（用大白话，不要讲术语）
 
-1. 双击本目录里的 **`start-zen-proxy.cmd`**，会弹出一个黑窗口，**别关它**（关了代理就停了）。
-2. 回到 ZCode，打开 **设置 → 模型服务**，找到 **「OpenCode 免费模型」**。
-   之后在聊天框的模型选择器里直接选它，跟内置模型一样用。
+> 装好了。**以后你什么都不用管**——每次开 ZCode 它自己就悄悄启动了，
+> 你不会看到任何黑窗口。去 **设置 → 模型服务** 找 **「OpenCode 免费模型」**，
+> 在聊天框的模型选择器里直接选着用，跟内置模型一样。
 
-不想要了怎么撤销：关掉黑窗口；把同目录的 `provider_config.json.bak-<时间戳>`
-复制回去覆盖 `provider_config.json`。
+**不想要了怎么撤销**：双击本目录的 `uninstall.cmd`。它会删掉那条自启钩子、
+并把这两个 Provider 从配置里摘掉，你的其它 Provider 和其它钩子都不受影响。
+
+---
+
+## 7.1 可选：跑一遍自测
+
+```bash
+node selftest.mjs
+```
+
+**期望输出**：`结果：16 通过 / 0 失败`。
+
+它用本地 mock 上游跑，**不打任何真实网络请求**，几秒出结果。覆盖免费判定、
+下架剔除、伪装头、体门禁、档位归一、Provider 增删的对称性。
+改动过 `zen-proxy.mjs` 之后建议跑一次再交付。
 
 ---
 
@@ -226,13 +267,14 @@ OpenCode Zen 的匿名免费档位接受一个公开占位符 `public` 作为凭
 **② 匿名通道按 IP 限速。**
 429 会被原样透传给用户。不要用它跑大批量任务。
 
-**③ 有两个模型在本机/本地区不可用，属于正常现象。**
-`muse-spark-1.2-contributor-free` 和 `muse-spark-1.3-contributor-free` 会返回
-`RegionError: This model is not available in your country`（地区限制）。
-不需要就把 `opencode-free-responses` 这组从配置里删掉，不影响其他模型。
+**③ 有一个模型在本地区不可用，属于正常现象。**
+`muse-spark-1.3-contributor-free`（也就是 `opencode-free-responses` 那一组里的唯一模型）
+会返回 `RegionError: This model is not available in your country`（地区限制）。
+不需要就把 `opencode-free-responses` 这组从配置里删掉，不影响其它 7 个模型。
 
-另外 `deepseek-v4-flash-free` 在 Zen 的实时清单里存在，但被元数据判为非免费而过滤掉了，
-且实测对所有思考档位组合都返回 400，等于当前不可用。
+> 早先版本里还有 `muse-spark-1.2-contributor-free` 和 `deepseek-v4-flash-free`，
+> 现在都不会再出现了——它们在 OpenCode 官方目录里标着「已下架」，
+> 判定规则已经和桌面版对齐把它们剔掉了。
 
 ---
 
@@ -241,11 +283,12 @@ OpenCode Zen 的匿名免费档位接受一个公开占位符 `public` 作为凭
 | 现象 | 排查 |
 | --- | --- |
 | 设置里没有「OpenCode 免费模型」 | 先看 `配置目标` 那行的括号内容，是不是「用户主目录兜底」；再看 `--detect` 的结论路径对不对 |
-| 有分组但一发消息就失败 | 代理没在跑。`curl http://127.0.0.1:41930/healthz` 确认；提醒用户别关黑窗口 |
+| 有分组但一发消息就失败 | 代理没在跑。`curl http://127.0.0.1:41930/healthz` 确认。手动 `node ensure-proxy.mjs` 能拉起来就说明钩子没生效——重跑 `node install.mjs` |
 | 报 403 `FreeTierError` | 伪装头或请求体门禁没过，上游收紧了。改 `zen-proxy.mjs` 里的 `OPENCODE_CLIENT_VERSION` 跟官方 CLI 版本号 |
 | 报 429 | 匿名通道按 IP 限速，等一会儿 |
 | 报 400 `invalid request` | 看代理 stderr 有没有「摘掉该字段重试」的日志；重试也失败说明这个模型当前不可用 |
-| 模型列表比预期少 | 看 `/healthz` 的 `catalog.status`，`static` = 还没联网成功，用的是内置兜底清单 |
+| 模型列表比预期少 | 看 `/healthz` 的 `catalog.status`，`static` = 还没联网成功，用的是内置兜底清单。目录里判定为「已下架」的模型会被有意剔掉，属正常 |
+| 改了代码怕改坏 | 跑 `node selftest.mjs`，16 项全过再交付 |
 
 代理日志走 **stderr**，`--print-config` 的 JSON 走 **stdout**，方便重定向。
 
@@ -254,22 +297,32 @@ OpenCode Zen 的匿名免费档位接受一个公开占位符 `public` 作为凭
 ## 10. 命令速查
 
 ```bash
-node zen-proxy.mjs --detect              # 看探测到的数据目录与判据
-node zen-proxy.mjs --print-config        # 看要写什么（apiKey 已脱敏，不落盘）
-node zen-proxy.mjs --write-config-only   # 只写配置后退出
-node zen-proxy.mjs                       # 起代理（常驻）
-node zen-proxy.mjs --port 41931          # 换端口
-node zen-proxy.mjs --config <完整路径>    # 直接指定 provider_config.json
-node zen-proxy.mjs --help                # 全部参数
+node install.mjs                        # 装上「随 ZCode 自动启动」（幂等）
+node install.mjs --uninstall            # 卸掉自启钩子
+node ensure-proxy.mjs                   # 手动触发一次检查+拉起（无窗口）
+node zen-proxy.mjs --detect             # 看探测到的数据目录与判据
+node zen-proxy.mjs --print-config       # 看要写什么（apiKey 已脱敏，不落盘）
+node zen-proxy.mjs --write-config-only  # 只写配置后退出
+node zen-proxy.mjs --remove-provider    # 从 ZCode 配置里摘掉本工具的两个 Provider
+node zen-proxy.mjs                      # 前台起代理（调试用，窗口要开着）
+node zen-proxy.mjs --port 41931         # 换端口
+node zen-proxy.mjs --config <完整路径>   # 直接指定 provider_config.json
+node selftest.mjs                       # 自测（本地 mock，不打真实网络）
+node zen-proxy.mjs --help               # 全部参数
 ```
 
 ## 11. 本包的文件
 
 ```
-zen-proxy.mjs        回环代理 + ZCode 配置同步（唯一必需文件，无外部依赖）
-start-zen-proxy.cmd  Windows 双击启动器
-README.md            给人看的说明
-AI-SETUP.md          本文件，给 AI 看的安装说明
+zen-proxy.mjs          回环代理 + ZCode 配置同步（唯一必需文件，无外部依赖）
+ensure-proxy.mjs       SessionStart 钩子：检查代理在不在，不在就静默拉起（无窗口）
+install.mjs            装/卸自启钩子
+install-autostart.cmd  双击这个 = 装上「随 ZCode 自动启动」
+uninstall.cmd          双击这个 = 彻底还原
+start-zen-proxy.cmd    手动前台启动（调试用）
+selftest.mjs           自测，16 项
+README.md              给人看的说明
+AI-SETUP.md            本文件，给 AI 看的安装说明
 ```
 
 **不要**把 `zcode-data-dir.txt` 拷到别的电脑——它记录的是源机器上的数据目录。
@@ -288,9 +341,24 @@ AI-SETUP.md          本文件，给 AI 看的安装说明
 思考档位归一、S1∩S2 模型目录、SSE 逐块透传、磁盘目录缓存。
 有意未移植：IP 池 / 代理轮换子系统、Go sidecar。
 
-**与上游项目的一处有意偏离**（重要，别改回去）：
-上游把 `reasoning_effort` 的 off/缺失/未知**一律归一成 `"none"`**，注释说这是关掉
-always-think 的唯一写法。但 2026-10 实测该写法会直接把请求打成 **400**，
-而且各模型接受的档位并不一致（`big-pickle` 只收 `minimal`→`max`；`nemotron-3.5`
-收 `none` 却拒 `off`）。本工具改为：只透传上游确实认的主动档位，
-`off`/`none`/缺失/未知一律**省略该字段**，另加一次「摘掉该字段重试」兜底。
+**与上游项目的两处有意偏离**（重要，别改回去）：
+
+**① `reasoning_effort` 不做「一律归一成 none」。**
+上游把 off/缺失/未知**一律归一成 `"none"`**，注释说这是关掉 always-think 的唯一写法。
+但 2026-10 实测该写法会直接把请求打成 **400**，而且各模型接受的档位并不一致
+（`big-pickle` 只收 `minimal`→`max`；`nemotron-3.5` 收 `none` 却拒 `off`）。
+本工具改为：只透传上游确实认的主动档位，`off`/`none`/缺失/未知一律**省略该字段**，
+另加一次「摘掉该字段重试」兜底。
+
+**② 「免费」的判定对齐 OpenCode 桌面版，并排除已下架模型。**
+桌面版的判定就一行（`packages/app/src/components/dialog-select-model.tsx`）：
+
+```ts
+const isFree = (provider, cost) => provider === "opencode" && (!cost || cost.input === 0)
+```
+
+本工具照搬，**外加排除 `status == "deprecated"`**。两点容易踩：
+只看 `input` 不看 `output`，且「没有 cost 数据」也算免费；
+Zen 会把下架模型留在公开清单里而标价仍是 0，不排除的话模型选择器里会出现
+点下去必报错的选项。目录里标称免费的有 34 个，过滤后剩 8 个，与桌面版完全相同。
+`selftest.mjs` 里有针对这一条的回归测试。

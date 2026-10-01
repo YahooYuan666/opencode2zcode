@@ -73,13 +73,15 @@ const CACHE_FILE_NAME = 'opencode2zcode-catalog.json';
  * S3 兜底：实测可用的免费 id（取自 opencode2pi-desktop，2026-09）。
  * 离线首启、目录还没拉到时用这份，保证 provider 声明不是空的。
  */
+/**
+ * 断网兜底清单：2026-10-01 对 models.dev 实时核对，等于桌面版当前那 8 个
+ * 「免费且未下架」的模型。联网成功后由实时目录取代，这里只在 S1 拿不到时用。
+ */
 const STATIC_FREE_MODELS = [
   'big-pickle',
   'ling-3.0-flash-fin-free',
   'longcat-2.5-preview-free',
-  'mimo-v2.5-free',
   'mimo-v2.6-flash-free',
-  'muse-spark-1.2-contributor-free',
   'muse-spark-1.3-contributor-free',
   'nemotron-3-ultra-free',
   'nemotron-3.5-lightning-free',
@@ -90,12 +92,11 @@ const CHAT_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high'];
 const SPACE_BUNNY_THINKING_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const MUSE_THINKING_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 
-/** 首启引导用的静态元数据（models.dev 实测值，2026-09）。 */
+/** 首启引导用的静态元数据（models.dev 实测值，2026-10）。 */
 const BOOTSTRAP_MODELS = [
   { id: 'big-pickle', contextWindow: 200000, maxTokens: 32000, supportsImages: false, thinkingLevels: CHAT_THINKING_LEVELS },
   { id: 'ling-3.0-flash-fin-free', contextWindow: 262144, maxTokens: 32768, supportsImages: false, thinkingLevels: CHAT_THINKING_LEVELS },
   { id: 'longcat-2.5-preview-free', contextWindow: 1000000, maxTokens: 131072, supportsImages: true, thinkingLevels: CHAT_THINKING_LEVELS },
-  { id: 'mimo-v2.5-free', contextWindow: 200000, maxTokens: 32000, supportsImages: true, thinkingLevels: CHAT_THINKING_LEVELS },
   { id: 'mimo-v2.6-flash-free', contextWindow: 200000, maxTokens: 32000, supportsImages: true, thinkingLevels: CHAT_THINKING_LEVELS },
   { id: 'nemotron-3-ultra-free', contextWindow: 1000000, maxTokens: 128000, supportsImages: false, thinkingLevels: CHAT_THINKING_LEVELS },
   { id: 'nemotron-3.5-lightning-free', contextWindow: 262144, maxTokens: 262144, supportsImages: false, thinkingLevels: CHAT_THINKING_LEVELS },
@@ -103,7 +104,6 @@ const BOOTSTRAP_MODELS = [
 ];
 
 const BOOTSTRAP_RESPONSES_MODELS = [
-  { id: 'muse-spark-1.2-contributor-free', contextWindow: 1048576, maxTokens: 131072, supportsImages: true, thinkingLevels: MUSE_THINKING_LEVELS },
   { id: 'muse-spark-1.3-contributor-free', contextWindow: 1048576, maxTokens: 131072, supportsImages: true, thinkingLevels: MUSE_THINKING_LEVELS },
 ];
 
@@ -371,7 +371,20 @@ function decodeModelsDev(data) {
   return result;
 }
 
-/** 是否免费：元数据优先（成本 0/0 且未废弃），元数据没就绪时看名字。 */
+/**
+ * 是否免费——与 OpenCode 桌面版逐位对齐。桌面版的判定就一行
+ * （packages/app/src/components/dialog-select-model.tsx）：
+ *
+ *   isFree = provider === "opencode" && (!cost || cost.input === 0)
+ *
+ * 两处容易踩的细节：
+ *   1. 只看 input，**不看 output**；并且「没有 cost 数据」也算免费。
+ *      早先这里要求 input 和 output 都为 0，比桌面版严，会漏掉模型。
+ *   2. 桌面版还会排除 status 为 deprecated 的条目。Zen 把下架模型留在公开
+ *      /models 和目录里（标价仍是 0），不排除的话模型选择器里会出现点下去
+ *      必报错的选项——实测 mimo-v2.5-free、muse-spark-1.2-contributor-free
+ *      就是这样被误放进来的。
+ */
 function decide(model, prices, ready) {
   const nameFree = isFreeModel(model);
   const fallback = (source) =>
@@ -379,12 +392,10 @@ function decide(model, prices, ready) {
   if (!ready || prices.size === 0) return fallback('metadata_pending');
   const price = prices.get(model);
   if (!price) return fallback('metadata_model_missing');
+  // 废弃是硬否决，后面的兜底也不许把它捞回来。
   if (price.deprecated) return { allowed: false, source: 'metadata_deprecated', known: true };
-  if (price.input === 0 && price.output === 0) {
+  if (price.input === undefined || price.input === 0) {
     return { allowed: true, source: nameFree ? 'name_and_metadata_free' : 'metadata_free', known: true };
-  }
-  if (price.input === undefined || price.output === undefined) {
-    return { allowed: false, source: 'metadata_cost_unknown', known: false };
   }
   return { allowed: false, source: 'metadata_paid', known: true };
 }
@@ -582,12 +593,11 @@ class ModelCatalog {
 
   decision(model) {
     const metadata = decide(model, this.#prices, this.#pricesReady);
-    // S3 兜底：编译期实测过的 id，在元数据未就绪/缺失/陈旧废弃时继续暴露。
-    if (
-      !metadata.allowed &&
-      (!metadata.known || metadata.source === 'metadata_deprecated') &&
-      STATIC_FREE_MODELS.includes(model)
-    ) {
+    if (metadata.allowed) return metadata;
+    // 目录已明确判定废弃时，S3 静态清单不再把它捞回来——那正是早先多出
+    // mimo-v2.5-free / muse-spark-1.2-contributor-free 的原因。S3 只兜「还说不准」。
+    if (metadata.source === 'metadata_deprecated') return metadata;
+    if (!metadata.known && STATIC_FREE_MODELS.includes(model)) {
       return { allowed: true, source: 'static_verified', known: false };
     }
     return metadata;
@@ -968,6 +978,45 @@ function buildZcodeConfig({ existing, port, chatModels, responsesModels }) {
   };
 }
 
+/**
+ * 从现有配置里摘掉本工具写入的两个 provider，别的 Provider 一律不动。
+ * 复用 buildZcodeConfig 的过滤口径，保证「装上去的」和「卸掉的」严格对称。
+ */
+function removeOurProviders(existing) {
+  const ourIds = new Set([PROVIDER_ID, RESPONSES_PROVIDER_ID]);
+  if (!existing || existing.schemaVersion !== 1 || !existing.config) return null;
+  const prior = existing.config;
+
+  const rules = Array.isArray(prior.providerConfigRules?.providerRules)
+    ? prior.providerConfigRules.providerRules.filter((rule) => rule && !ourIds.has(rule.providerId))
+    : [];
+  const modelRules = Array.isArray(prior.modelConfigRules?.providerModelRules)
+    ? prior.modelConfigRules.providerModelRules.filter((rule) => rule && !ourIds.has(rule.providerId))
+    : [];
+  const manualRules = Array.isArray(prior.modelConfigRules?.manualProviderModelRules)
+    ? prior.modelConfigRules.manualProviderModelRules.filter((rule) => rule && !ourIds.has(rule.providerId))
+    : [];
+  const order = Array.isArray(prior.providerOrder)
+    ? prior.providerOrder.filter((id) => typeof id === 'string' && !ourIds.has(id))
+    : [];
+
+  const removed =
+    (Array.isArray(prior.providerConfigRules?.providerRules) ? prior.providerConfigRules.providerRules.length : 0) -
+    rules.length;
+
+  return {
+    removed,
+    config: {
+      providerOrder: order,
+      providerConfigRules: { providerRules: rules },
+      modelConfigRules: {
+        providerModelRules: modelRules,
+        manualProviderModelRules: manualRules,
+      },
+    },
+  };
+}
+
 function writeZcodeConfig(configPath, config) {
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
   if (fs.existsSync(configPath)) {
@@ -1241,6 +1290,8 @@ function parseArgs(argv) {
       options.mode = 'print';
     } else if (arg === '--write-config-only') {
       options.mode = 'write';
+    } else if (arg === '--remove-provider') {
+      options.mode = 'remove';
     } else if (arg === '--detect') {
       options.mode = 'detect';
     } else if (arg === '--help' || arg === '-h') {
@@ -1259,8 +1310,13 @@ const HELP = `opencode2zcode — 把 OpenCode Zen 匿名免费模型接进 ZCode
   node zen-proxy.mjs --detect            只列出候选数据目录与判据，确认写到哪儿
   node zen-proxy.mjs --print-config      只打印将要写入的配置（不落盘、不起服务）
   node zen-proxy.mjs --write-config-only 只写配置后退出
+  node zen-proxy.mjs --remove-provider   从 ZCode 配置里摘掉本工具的两个 Provider
   node zen-proxy.mjs --port 41930        指定回环端口
   node zen-proxy.mjs --config <path>     直接指定 provider_config.json 完整路径
+
+装成「随 ZCode 自动启动」（装完就不用再管，也没有黑窗口）：
+  node install.mjs               写入 SessionStart 钩子
+  node install.mjs --uninstall   移除该钩子
 
 配置落点按这个顺序决定：
   --config  >  ZCODE_DATA_BASE_DIR 环境变量  >  自动探测  >  旁路文件  >  用户主目录
@@ -1367,6 +1423,23 @@ async function main() {
     applyCatalog(port, configPath);
     console.log(`已写入 ${configPath}`);
     console.log(`chat ${state.chatModels.length} 个模型 / responses ${state.responsesModels.length} 个模型`);
+    return;
+  }
+
+  if (options.mode === 'remove') {
+    const result = removeOurProviders(readExistingConfig(configPath));
+    if (!result) {
+      console.log(`[zen] ${configPath} 不存在或不是本工具写的配置，无需清理。`);
+      return;
+    }
+    if (result.removed === 0) {
+      console.log(`[zen] 配置里没有本工具的 Provider，无需清理。`);
+      return;
+    }
+    writeZcodeConfig(configPath, { schemaVersion: 1, config: result.config });
+    lastWritten = '';
+    console.log(`[zen] 已从 ${configPath} 移除 ${result.removed} 个 Provider（${PROVIDER_ID} / ${RESPONSES_PROVIDER_ID}）`);
+    console.log('[zen] 你的其它 Provider 原样保留。');
     return;
   }
 

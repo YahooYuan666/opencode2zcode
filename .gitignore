@@ -1,0 +1,4 @@
+# 运行时产物：记录本机探测结果，别跟着提交
+zcode-data-dir.txt
+.proxy-start.lock
+*.bak-*

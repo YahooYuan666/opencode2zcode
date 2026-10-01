@@ -32,8 +32,8 @@ const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ENSURE = path.join(SCRIPT_DIR, 'ensure-proxy.mjs');
 const HOOK_TIMEOUT_MS = 12_000;
 
-/** 规范化后的自身路径，install / uninstall 共用同一把尺子。 */
-const ENSURE_KEY = path.resolve(ENSURE).replace(/\\/g, '/').toLowerCase();
+/** 认领钩子用的文件名；也是本工具在 ZCode 配置里唯一的身份标识。 */
+const ENSURE_BASENAME = 'ensure-proxy.mjs';
 
 function zcodeCliConfigPath() {
   const home = process.env.USERPROFILE?.trim() || os.homedir();
@@ -63,19 +63,37 @@ function writeJsonWithBackup(file, value) {
   fs.renameSync(temporary, file);
 }
 
-/** 这条钩子是不是我们的。只认自己写进去的那一条，不误伤别人的 SessionStart 钩子。 */
+/**
+ * 这条 SessionStart 钩子是不是 opencode2zcode 的。
+ *
+ * 认的是**脚本文件名**，不是绝对路径。这一点很关键：ZCode 的钩子必须写绝对
+ * 路径，而绝对路径会在项目目录被移动/改名后失效。早先按完整路径比对，导致
+ * 「把项目文件夹改名后再装一次」会被当成没装过，于是一条新的加上去、那条
+ * 指向旧路径的死钩子留在配置里——每次开 ZCode 都会跑一个不存在的文件。
+ * 按文件名认则天然幂等：重装即替换。
+ */
 function isOurHook(entry) {
   const list = Array.isArray(entry?.hooks) ? entry.hooks : [];
   return list.some((hook) => {
     if (!Array.isArray(hook?.args)) return false;
-    // 比对规范化后的绝对路径：装的时候写什么、卸载时就算什么，
-    // 不靠子串猜——目录名里带点、斜杠方向不同都会让子串匹配失效。
-    return hook.args.some((arg) => {
-      if (typeof arg !== 'string') return false;
-      const normalized = path.resolve(arg).replace(/\\/g, '/').toLowerCase();
-      return normalized === ENSURE_KEY;
-    });
+    return hook.args.some(
+      (arg) => typeof arg === 'string' && path.basename(arg).toLowerCase() === ENSURE_BASENAME,
+    );
   });
+}
+
+/** 钩子指向的文件还在不在。不在就是条死钩子，装的时候顺手清掉。 */
+function hookTargetExists(entry) {
+  const list = Array.isArray(entry?.hooks) ? entry.hooks : [];
+  for (const hook of list) {
+    if (!Array.isArray(hook?.args)) continue;
+    for (const arg of hook.args) {
+      if (typeof arg === 'string' && path.basename(arg).toLowerCase() === ENSURE_BASENAME) {
+        return fs.existsSync(arg);
+      }
+    }
+  }
+  return true;
 }
 
 function install() {
@@ -97,16 +115,22 @@ function install() {
     ],
   };
 
-  if (existing.some(isOurHook)) {
-    console.log('[install] 自启钩子已经在位，无需重复安装。');
-  } else {
-    events.SessionStart = [entry, ...existing];
-    config.hooks.events = events;
-    writeJsonWithBackup(configPath, config);
-    console.log(`[install] 已写入 SessionStart 钩子：${configPath}`);
+  // 别人的钩子原样留下；我们自己那条永远只留一条，且永远指向当前这个目录。
+  const foreign = existing.filter((item) => !isOurHook(item));
+  const stale = existing.filter((item) => isOurHook(item) && !hookTargetExists(item));
+
+  events.SessionStart = [entry, ...foreign];
+  config.hooks.events = events;
+  writeJsonWithBackup(configPath, config);
+
+  if (stale.length > 0) {
+    console.log(`[install] 清掉了 ${stale.length} 条指向已不存在目录的旧钩子。`);
   }
+  console.log(`[install] 已写入 SessionStart 钩子：${configPath}`);
   console.log(`[install] 钩子命令：${process.execPath} ${ENSURE}`);
   console.log('[install] 从现在起，启动 ZCode 会自动静默拉起代理，不用再双击任何东西。');
+  console.log('[install] 注意：上面这个路径是写死的。以后若移动或改名了本目录，');
+  console.log('[install]        到新位置重跑一次本命令即可（旧的会被自动替换）。');
 }
 
 function uninstall() {

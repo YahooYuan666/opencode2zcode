@@ -202,15 +202,24 @@ nemotron-3-ultra-free nemotron-3.5-lightning-free  space-bunny-free
 
 ### 评分能不能显示在 ZCode 里
 
-**不能。** ZCode 的模型配置 schema 是 `.strict()` 的，白名单里只有这些叶子：
-`contextWindow`、`inputFormat`（`supportsImage` / `supportsVideo` / `supportsPdf`）、
-`supportsToolCall`、`supportsJsonSchemaOutput`、`supportsNativeWebSearch`、
-`supportsMidConversationSystem`，以及 `optionSpecs` 下的 `reasoningLevel` 和
-`maxOutputTokens`。**没有 `description`、没有评分字段**，写了也会被丢弃。
+**数据拿得到，但显示不了——卡在 ZCode 那边，不是卡在本工具。**
 
-所以本工具不硬塞评分。可用的信息还是有的：**上下文窗口、最大输出、思考档位
-阶梯**这三项会真实显示在模型选择器里，档位多少也间接反映了思考深度。需要横向
-对比评分的话，用同作者的 `provider-fetcher` 查那张表更合适。
+- **拿得到**：评分要用的六项（上下文窗口、最大输出、推理档位、工具调用、多模态、
+  结构化输出）全都来自 models.dev，而本工具**本来就在拉 models.dev**。想算的话
+  在这里加十行就够了，不需要额外数据源。
+- **写不进**：ZCode 的模型配置 schema 是 `.strict()` 白名单，只认这些叶子——
+  `contextWindow`、`inputFormat`（`supportsImage` / `supportsVideo` / `supportsPdf`）、
+  `outputFormat`、`supportsToolCall`、`supportsJsonSchemaOutput`、
+  `supportsNativeWebSearch`、`supportsMidConversationSystem`，
+  以及 `optionSpecs` 下的 `reasoningLevel` 和 `maxOutputTokens`。
+  **没有 `description`、没有评分、没有显示名/别名**，多写的键会被直接丢弃。
+  模型 ID 也不能拿来改名——它要原样发给上游 API。
+
+所以本工具不硬塞评分。界面上真实可见的是：**上下文窗口、最大输出、思考档位阶梯**
+（这三项能间接反映模型的思考深度），外加模型 ID 本身携带的名字信息。
+需要横向对比评分，用同作者的 `provider-fetcher` 查那张表。
+
+> 万一将来 ZCode 加了这个字段，这里补上就是改 `buildModelRule` 一个函数的事。
 
 ### 与上游项目的两处**有意偏离**
 
@@ -321,9 +330,30 @@ zcode-data-dir.txt     运行后自动生成，记录探测到的数据根；不
 ## 拿到别人的电脑上用
 
 整个目录可以直接拷走，**不含任何机器专属路径**——数据目录靠自动探测。
-目标机上如果是 AI 在操作，让它读 **`AI-SETUP.md`**，里面有逐步命令、期望输出和排查分支。
 
-人类用户只要双击 `install-autostart.cmd`，之后就不用再管了。
+### 分享给人类用户
+
+把整个文件夹（或 zip）发过去，对方**双击 `install-autostart.cmd`** 就完事。
+装完不用再管，也没有黑窗口。
+
+### 分享给「让对方的 AI 来装」
+
+让那个 AI **先读 `AI-SETUP.md`**，里面有逐步命令、每步的期望输出、以及各种失败分支。
+`AI-SETUP.md` 第 6 节就是安装自启那一步。
+
+### ⚠️ 唯一需要对方动手的事
+
+ZCode 的钩子必须写**绝对路径**，所以 `install.mjs` 会把**当时那个位置的**
+`ensure-proxy.mjs` 路径记进 ZCode 的配置。这就带来一条规则：
+
+> **`install-autostart.cmd` 必须在「最终摆放位置」上运行。**
+> 对方把文件夹解压到哪、就在哪运行——不要先在 A 处运行、再把文件夹挪到 B 处。
+
+如果确实挪过了，**到新位置重跑一次 `install-autostart.cmd` 就行**：它会认出自己的
+旧钩子并替换掉，指向已不存在的旧路径那条会被自动清掉，不会越堆越多。
+
+（为什么非得是绝对路径：ZCode 的钩子变量 `${ZCODE_PROJECT_DIR}` 是**工作区**相对
+路径，指向的是你打开的项目文件夹，不是本工具的安装位置，用不上。）
 
 ## 自启是怎么做到的（以及它的边界）
 

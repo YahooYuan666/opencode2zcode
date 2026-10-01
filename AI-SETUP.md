@@ -128,11 +128,12 @@ opencode2zcode.exe --write-config-only
 ```
 [zen] 配置目标（自动探测）：<数据根>\.zcode\v2\provider_config.json
 已写入 <数据根>\.zcode\v2\provider_config.json
-chat 7 个模型 / responses 1 个模型
+chat N 个模型 / responses 1 个模型（N 随上游增减，当前为 8）
 ```
 
-> 期望是 **chat 7 个 / responses 1 个**，合计 8 个——与 OpenCode 桌面版当前列出的
-免费模型完全一致。
+> 期望是 **responses 1 个**（muse-spark）、chat 道若干个——合计与 OpenCode 桌面版
+> 当前列出的免费模型完全一致。**数量随上游自动增减**（2026-10-02 实测 chat 8 +
+> responses 1 = 9），不要拿本文写的数字当硬性预期。
 > 数字对不上通常意味着目录刷新没成功（`catalog.source` 不是 `live`），
 > 或者上游在变——先跑 `--detect` 和 `/healthz` 确认，不要硬凑。
 
@@ -218,7 +219,7 @@ curl http://127.0.0.1:41930/healthz
 ```
 [zen] 回环代理已监听 127.0.0.1:41930
 [zen] 已同步 ZCode 配置：<数据根>\.zcode\v2\provider_config.json
-[zen] chat 7 个 / responses 1 个模型
+[zen] chat 8 个 / responses 1 个模型（数字随上游增减）
 ```
 
 然后 `curl` 应回 `"ok":true` 且 `catalog.source` 为 `live`

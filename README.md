@@ -200,7 +200,8 @@ const isFree = (provider, cost) => provider === "opencode" && (!cost || cost.inp
 1. **只看 `input`，不看 `output`**；并且「没有 cost 数据」也算免费。
 2. **必须排除已下架**。Zen 把下架模型留在公开 `/models` 和目录里，标价仍是 0。
    不排除的话，模型选择器里会出现点下去必报错的选项。
-3. 因此「目录标称免费」当前有 34 个，**过滤后剩 8 个，与桌面版完全相同**：
+3. 因此「目录标称免费」34 个里**过滤后剩下的与桌面版完全相同**（数量随上游
+   增减自动跟随——2026-10-02 实测 9 个，此前是 8 个）：
 
 ```
 big-pickle            ling-3.0-flash-fin-free   longcat-2.5-preview-free
@@ -214,8 +215,8 @@ nemotron-3-ultra-free nemotron-3.5-lightning-free  space-bunny-free
 
 ### 两条线格式，共用同一道门禁
 
-`muse-spark-1.3-contributor-free` 只挂在 OpenCode 的 `/v1/responses` 上，其余 7 个
-走 `/v1/chat/completions`。**两条都要过同一道免费档门禁**——请求体里必须有
+`muse-spark-1.3-contributor-free` 只挂在 OpenCode 的 `/v1/responses` 上，其余的
+走 `/v1/chat/completions`（哪些模型挂哪条道由上游决定，清单自动跟随）。**两条都要过同一道免费档门禁**——请求体里必须有
 `bash` 和 `read` 两个工具定义，缺了就是：
 
 ```
@@ -295,7 +296,7 @@ ZCode 个人配置有两条模型元数据车道：`providerModelRules`（smart�
 
 ```
 GET  /healthz                              -> 200，目录 source=live，84 个模型，暴露 9 个
-GET  /v1/models                            -> 7 个 chat 模型
+GET  /v1/models                            -> chat 道全部模型（随上游增减）
 POST /v1/chat/completions  big-pickle      -> 200，SSE 流式正常返回，模型回了 "OK"
      同上，带 reasoning_effort:"none"       -> 200（档位被摘掉，不再 400）
      同上，带 reasoning_effort:"high"       -> 200（原样透传）
@@ -312,10 +313,10 @@ node selftest.mjs                 23/23   Node 版回归
 node rust/tests/fresh-machine-dryrun.mjs  29/29  新机器演练
 ```
 
-配置里实际是 **8 个模型**：`opencode-free` 7 个（chat 道）+ `opencode-free-responses`
-1 个（`muse-spark-1.3-contributor-free`，responses 道）。`/healthz` 里的
-`exposed: 9` 比这个多 1，是 `jev-*` 系列的模型——它两条道都不走（只答 `/systemone`），
-本来就不该进配置。
+配置里的模型数**随上游自动增减**，不做上限：`opencode-free`（chat 道）+
+`opencode-free-responses`（responses 道，目前只有 muse-spark）。判定规则与
+OpenCode 桌面版逐位一致，桌面版列多少这里就写多少。`/healthz` 里的 `exposed`
+比分道统计略多——`jev-*` 系列两条道都不走（只答 `/systemone`），本来就不该进配置。
 
 **已知限制，都不是本工具的 bug：**
 
@@ -336,7 +337,7 @@ node rust/tests/fresh-machine-dryrun.mjs  29/29  新机器演练
 | 模型列表比预期少 | 看 `/healthz` 的 `catalog.status`：`static` 表示还没联网成功，用的是内置兜底清单；`lastError` 会写原因。目录里判定为「已下架」的模型会被有意剔掉 |
 | 对话报 403 `FreeTierError` | 伪装头或体门禁没过，上游收紧了。`x-opencode-client` / `user-agent` 的版本号可能要跟着官方 CLI 更新 |
 | 对话报 429 | 匿名通道按 IP 限速，等一会儿 |
-| 请求 `/v1/responses` 报 501 | 这是预期行为，见「为什么默认只有 7 个」那一节 |
+| 模型数和文档里写的不一样 | 正常——清单随上游自动增减，以 `curl http://127.0.0.1:41930/v1/models` 实时结果为准 |
 | 对话报 400 `invalid request` | 看代理 stderr 有没有「摘掉该字段重试」的日志；若重试也 400，多半是这个模型当前不可用 |
 | 想撤销 | 双击 `uninstall.cmd`（钩子和 Provider 一起清干净）。只想清 Provider 就 `node zen-proxy.mjs --remove-provider`；只想停自启就 `node zen-proxy.mjs --uninstall` |
 

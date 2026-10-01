@@ -109,7 +109,7 @@ try {
   if (parsed) {
     const ids = parsed.config.providerConfigRules.providerRules.map((r) => r.providerId);
     step('含 opencode-free', ids.includes('opencode-free'), ids.join(','));
-    step('默认不含 opencode-free-responses（那条道 403）', !ids.includes('opencode-free-responses'), ids.join(','));
+    step('含 opencode-free-responses（responses 道也可用）', ids.includes('opencode-free-responses'), ids.join(','));
     step(
       'apiKey 已脱敏（不泄露）',
       !preview.includes('sk-') && preview.includes('已隐藏'),
@@ -124,16 +124,7 @@ try {
     r.providerId.startsWith('opencode-free'),
   );
   const modelCount = ours.reduce((s, r) => s + r.config.personalModelIds.length, 0);
-  step(
-    '写入了 7 个 chat 模型（目录里 8 个减去只有 responses 道的 muse-spark）',
-    modelCount === 7,
-    `实际 ${modelCount} 个`,
-  );
-  step(
-    '没有 responses 那一组（那条道上游对外部一律 403）',
-    !ours.some((r) => r.providerId === 'opencode-free-responses'),
-    ours.map((r) => r.providerId).join(','),
-  );
+  step('写入了 8 个模型（chat 7 + responses 1）', modelCount === 8, `实际 ${modelCount} 个`);
 
   console.log('\n[4] AI-SETUP.md 第 6 节：装自启');
   const install = run(['--install']);
@@ -202,7 +193,7 @@ try {
       health.port !== 41930 || true,
       `实际端口 ${health.port}`,
     );
-    step('模型数正确（7 chat / 0 responses）', health.chatModels === 7 && health.responsesModels === 0,
+    step('模型数正确（7 chat / 1 responses）', health.chatModels === 7 && health.responsesModels === 1,
       `chat ${health.chatModels} / responses ${health.responsesModels}`);
   }
 

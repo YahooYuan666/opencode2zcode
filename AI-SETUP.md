@@ -128,12 +128,11 @@ opencode2zcode.exe --write-config-only
 ```
 [zen] 配置目标（自动探测）：<数据根>\.zcode\v2\provider_config.json
 已写入 <数据根>\.zcode\v2\provider_config.json
-chat 7 个模型 / responses 0 个模型
+chat 7 个模型 / responses 1 个模型
 ```
 
-> 期望是 **chat 7 个 / responses 0 个**。这 7 个是目录里那 8 个「免费且未下架」模型中
-唯一真能调用的——第 8 个（`muse-spark-1.3-contributor-free`）所在的 responses 通道
-上游对外部一律 403，见第 8 节。
+> 期望是 **chat 7 个 / responses 1 个**，合计 8 个——与 OpenCode 桌面版当前列出的
+免费模型完全一致。
 > 数字对不上通常意味着目录刷新没成功（`catalog.source` 不是 `live`），
 > 或者上游在变——先跑 `--detect` 和 `/healthz` 确认，不要硬凑。
 
@@ -219,7 +218,7 @@ curl http://127.0.0.1:41930/healthz
 ```
 [zen] 回环代理已监听 127.0.0.1:41930
 [zen] 已同步 ZCode 配置：<数据根>\.zcode\v2\provider_config.json
-[zen] chat 7 个 / responses 0 个模型
+[zen] chat 7 个 / responses 1 个模型
 ```
 
 然后 `curl` 应回 `"ok":true` 且 `catalog.source` 为 `live`
@@ -279,30 +278,17 @@ OpenCode Zen 的匿名免费档位接受一个公开占位符 `public` 作为凭
 **② 匿名通道按 IP 限速。**
 429 会被原样透传给用户。不要用它跑大批量任务。
 
-**③ 有一个模型调不通，属于上游限制，不是本工具的 bug。**
-`muse-spark-1.3-contributor-free` 只挂在 OpenCode 的 `/v1/responses` 通道上，
-而那条通道对**匿名**调用一律 403：
+**③ 两条线格式的规则不一样，别照搬。**
+`muse-spark-1.3-contributor-free` 走 `/v1/responses`，其余 7 个走
+`/v1/chat/completions`。**两条都要过同一道门禁**（请求体里必须有 `bash` 和 `read`
+两个工具），否则 403。代理已经处理好了，但如果对方要自己改代码，注意两点：
 
-```
-OpenCode's free tier can only be used from within OpenCode
-```
+- responses 的工具定义是**扁平**的 `{type, name, description, parameters}`；
+  套 chat 那种嵌套 `{type, function:{name}}` 会被上游判 400。
+- responses **一个 `tool_choice` 都不能带**，包括 `"none"`。代理会摘掉再转发。
 
-原因不是少了什么请求头，而是**额度归属**：对照 OpenCode 自己的模型清单
-（`packages/console/app/src/component/go-models.ts`），能匿名用的免费模型额度都是
-`Infinity`（`space-bunny-free`、`longcat-2.5-preview-free`），而 muse-spark 是
-45300 / 5 小时的**计量额度、且带地区限制**，只发给登录用户。转发给上游推理服务时
-OpenCode 会注入自己那把真实 API key，`public` 换来的身份是空的，所以被拒。
-
-已逐项试过，都不是协议细节：补 `bash`/`read` 门禁工具、换 Responses 扁平工具格式、
-补 `x-zen-model` / `x-zen-billing-source` 头、去掉 `-free` 后缀——全部无效。
-上游的 `opencode2pi-desktop` 同样如此。
-
-所以工具**默认不把这一组写进配置**，模型选择器里不会出现它。
-上游哪天放开（或用户愿意用自己的 OpenCode 账号 key），`--with-responses` 可以加回来。
-
-> 早先版本里还有 `muse-spark-1.2-contributor-free` 和 `deepseek-v4-flash-free`，
-> 现在都不会再出现了——它们在 OpenCode 官方目录里标着「已下架」，
-> 判定规则已经和桌面版对齐把它们剔掉了。
+这条门禁跟账号无关：不需要登录，也没有地区问题（未登录的 OpenCode 桌面版
+同样能调通）。
 
 ## 9. 出问题时怎么排查
 
@@ -334,7 +320,7 @@ opencode2zcode.exe --remove-provider    # 从 ZCode 配置里摘掉本工具的�
 opencode2zcode.exe                      # 前台起代理（调试用，窗口要开着）
 opencode2zcode.exe --port 41931         # 换端口
 opencode2zcode.exe --config <完整路径>   # 直接指定 provider_config.json
-opencode2zcode.exe --with-responses     # 连 responses 道那一组也写进配置（默认不写）
+opencode2zcode.exe --with-responses     # 兼容旧命令行（responses 组现在默认就写）
 opencode2zcode.exe --help               # 全部参数
 ```
 

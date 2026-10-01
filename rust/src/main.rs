@@ -61,14 +61,13 @@ const HELP: &str = "opencode2zcode — 把 OpenCode Zen 匿名免费模型接进
   opencode2zcode --remove-provider   只从 ZCode 配置里摘掉本工具的两个 Provider
   opencode2zcode --port 41930        指定回环端口
   opencode2zcode --config <path>     直接指定 provider_config.json 完整路径
-  opencode2zcode --with-responses    连 responses 道那一组也写进配置（默认不写，见下）
+  opencode2zcode --with-responses    兼容旧命令行（responses 组现在默认就写）
 
 装完就不用再管了：启动 ZCode 时会自动静默拉起代理，不会有任何窗口。
 
-为什么没有 responses 道那一组：OpenCode 的 /v1/responses 通道对外部调用一律
-拒绝（403「免费档只允许在 OpenCode 内部使用」），是上游 provider 的限制，
-伪造请求头过不去。默认只暴露确实能用的 chat 道（7 个模型）。上游哪天放开
-了，加 --with-responses 就能把它加回来。
+两条线格式都接：chat 道 7 个模型 + responses 道 1 个（muse-spark）。
+两者共用同一道免费档门禁——请求体里必须带 bash 和 read 两个工具定义，
+详见 README「免费通道怎么过」。
 
 配置落点按这个顺序决定：
   --config  >  ZCODE_DATA_BASE_DIR 环境变量  >  自动探测  >  旁路文件  >  用户主目录
@@ -95,8 +94,8 @@ struct Options {
     port: Option<u16>,
     config_path: Option<String>,
     mode: Mode,
-    /// 是否把 responses 道那一组也写进配置。默认**否**——那条道现在 100% 调不通，
-    /// 写进去只是让模型选择器里多一个点下去必报错的分组。详见 RESPONSES_LANE_NOTE。
+    /// `--with-responses` 现在是历史兼容开关：默认已经会写 responses 那一组。
+    /// 保留它是为了让旧命令行不至于报错。门禁规则见 zen::Lane。
     with_responses: bool,
 }
 
@@ -143,11 +142,8 @@ fn apply_catalog(
     with_responses: bool,
 ) {
     let chat = zcode::chat_model_entries(catalog);
-    let responses = if with_responses {
-        zcode::responses_model_entries(catalog)
-    } else {
-        Vec::new()
-    };
+    let _ = with_responses; // 门禁修好后默认就写，这一组是真能用的
+    let responses = zcode::responses_model_entries(catalog);
     *state.chat_models.lock().unwrap() = chat.iter().map(|m| m.id.clone()).collect();
     *state.responses_models.lock().unwrap() = responses.iter().map(|m| m.id.clone()).collect();
     *state.catalog_status.lock().unwrap() = serde_json::to_value(catalog.snapshot()).unwrap_or(json!({}));
@@ -279,11 +275,7 @@ fn main() {
 
     if options.mode == Mode::Print {
         let chat = zcode::chat_model_entries(&catalog);
-        let responses = if options.with_responses {
-            zcode::responses_model_entries(&catalog)
-        } else {
-            Vec::new()
-        };
+        let responses = zcode::responses_model_entries(&catalog);
         let existing = zcode::read_existing_config(&config_path);
         let config = zcode::build_zcode_config(existing.as_ref(), requested_port, &chat, &responses);
         eprintln!("# 目标文件：{}", config_path.display());

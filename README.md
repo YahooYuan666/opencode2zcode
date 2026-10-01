@@ -212,48 +212,33 @@ nemotron-3-ultra-free nemotron-3.5-lightning-free  space-bunny-free
 > `mimo-v2.5-free` 和 `muse-spark-1.2-contributor-free`（两个都已下架）。
 > `selftest.mjs` 里有针对这一条的回归测试。
 
-### 为什么默认只有 7 个，目录里却是 8 个
+### 两条线格式，共用同一道门禁
 
-第 8 个是 `muse-spark-1.3-contributor-free`，它只挂在 OpenCode 的 `/v1/responses`
-通道上。而**那条通道对匿名调用一律拒绝**：
+`muse-spark-1.3-contributor-free` 只挂在 OpenCode 的 `/v1/responses` 上，其余 7 个
+走 `/v1/chat/completions`。**两条都要过同一道免费档门禁**——请求体里必须有
+`bash` 和 `read` 两个工具定义，缺了就是：
 
 ```
 403  OpenCode's free tier can only be used from within OpenCode
 ```
 
-**这不是伪装请求头能过的门禁，是「额度归属」问题。** 对照 OpenCode 自己的模型
-清单（`packages/console/app/src/component/go-models.ts`）看得很清楚：
+这个门禁是**纯请求体判定**，跟账号、key、地区都无关：没登录的 OpenCode 桌面版
+同样能调通，本工具也能。踩过的两个坑：
 
-| 模型 | 额度 | 地区限制 | 匿名（`public`）能用吗 |
-| --- | --- | --- | --- |
-| `space-bunny-free` | `Infinity` | 否 | ✅ 能 |
-| `longcat-2.5-preview-free` | `Infinity` | 否 | ✅ 能 |
-| `muse-spark-1.3-contributor` | 45300 / 5 小时 | 是 | ❌ 不能 |
-
-**能匿名用的那几个是无限额的；muse-spark 是给登录用户用的计量额度。** 上游推理
-服务（错误信息前缀 `Error from provider (Console)`）认的是 OpenCode 自己那把真实
-API key——`packages/console/app/src/routes/zen/util/handler.ts` 在转发给 provider
-时会 `headers.set` 上 `x-zen-model` 和 `x-zen-billing-source`，并注入真实凭据。
-`public` 换来的 `authInfo` 是空的，`billingSource` 落到 `anonymous`，于是被拒。
-
-2026-10 逐项试过，都不是协议细节问题：
-
-| 尝试 | 结果 |
+| 坑 | 后果 |
 | --- | --- |
-| 补 `bash` / `read` 门禁工具（chat 道靠它过门禁） | 无效 |
-| 换 Responses API 的扁平工具格式 | 无效 |
-| 补 `x-zen-model` / `x-zen-billing-source` 头 | 无效 |
-| 去掉 `-free` 后缀用 `muse-spark-1.3-contributor` | `Model is not supported` |
-| 把 muse-spark 放到 chat 道试 | 500（该模型不在这一道） |
+| responses 道补工具时套了 chat 道的嵌套格式 `{type,function:{name}}` | 上游 400 `tools[0] missing required field name` |
+| 照搬了 chat 道的 `tool_choice: "none"` | 上游 400，**Responses API 只接受 `auto` / `required` / 具体工具名** |
 
-**上游的 `opencode2pi-desktop` 有同样的限制，原因完全一样**——它也拿不到登录凭据。
+第二个坑特别隐蔽：当时据此下了「responses 道过不去、没有救」的结论。真相是
+**门禁规则和 chat 道完全一样**，只是线格式有别——工具定义要扁平，`tool_choice`
+一个都不能带。
 
-所以默认**不把这一组写进配置**：写进去只是让模型选择器里多一个点下去必报错的
-分组。上游哪天放开了，`--with-responses` 就能加回来。
-
-> **唯一能真正用上 muse-spark 的办法**：拿你自己 OpenCode 账号的 Zen key 代替
-> `public`。那样 `authInfo` 有值、额度记在你账上，它就是可用的。本工具刻意不这么做
-> ——它的定位是「不碰任何账号的匿名通道」，一旦要用户交出真实凭据，它就不是那个东西了。
+> 定位方法值得记一下：光靠猜是猜不出来的。把 `XDG_CONFIG_HOME` 指向临时目录、
+> 在配置里把 opencode provider 的 `baseURL` 改到本地，就能让真的 OpenCode CLI
+> 把它的原始请求发过来（`rust/tests/capture-opencode-request.mjs`），
+> 再拿抓到的请求对着上游逐项减字段回放（`replay-gate-probe.mjs`），
+> 二分出到底是哪个字段在起作用。用户一句「我桌面版没登录也能用」直接推翻结论。
 
 ### 评分能不能显示在 ZCode 里
 
@@ -314,19 +299,23 @@ GET  /v1/models                            -> 7 个 chat 模型
 POST /v1/chat/completions  big-pickle      -> 200，SSE 流式正常返回，模型回了 "OK"
      同上，带 reasoning_effort:"none"       -> 200（档位被摘掉，不再 400）
      同上，带 reasoning_effort:"high"       -> 200（原样透传）
-POST /v1/responses  任意模型                 -> 501 + 诊断（这条道上游对外部一律 403）
+POST /v1/responses  muse-spark-1.3-...     -> 200，SSE 正常，模型回了 "OK"
 POST 不存在的模型                            -> 上游 ModelError + 401，原样透传
 非回环 Host 访问 /healthz                    -> 403 loopback requests only
+
+POST /v1/responses  带 tool_choice:"none"   -> 代理摘掉后 200（带上去上游会 400）
 
 cargo test                        25/25
 node rust/tests/cli-parity.mjs    18/18   Node 版 vs Rust 版，配置逐字节一致
 node rust/tests/live-mock.mjs     21/21   端到端打本地 mock
-node selftest.mjs                 24/24   Node 版回归
+node selftest.mjs                 23/23   Node 版回归
+node rust/tests/fresh-machine-dryrun.mjs  29/29  新机器演练
 ```
 
-配置里实际是 **7 个模型**，都在 `opencode-free`（chat 道）。`/healthz` 里的
-`exposed: 9` 比这个多 2：一个是 `muse-spark-1.3-contributor-free`（只挂 responses 道，
-而那条道调不通，见下），另一个是 `jev-*` 系列（两条道都不走，只答 `/systemone`）。
+配置里实际是 **8 个模型**：`opencode-free` 7 个（chat 道）+ `opencode-free-responses`
+1 个（`muse-spark-1.3-contributor-free`，responses 道）。`/healthz` 里的
+`exposed: 9` 比这个多 1，是 `jev-*` 系列的模型——它两条道都不走（只答 `/systemone`），
+本来就不该进配置。
 
 **已知限制，都不是本工具的 bug：**
 
@@ -471,7 +460,10 @@ cargo build --release
 ```bash
 cd rust && cargo test              # 25 项单元测试
 node rust/tests/cli-parity.mjs     # 16 项：Node 版 vs Rust 版对拍
-node rust/tests/live-mock.mjs      # 20 项：端到端（本地 mock 上游）
+node rust/tests/live-mock.mjs      # 21 项：端到端（本地 mock 上游）
+node rust/tests/fresh-machine-dryrun.mjs  # 29 项：模拟另一台电脑，从 zip 装一遍
+node rust/tests/capture-opencode-request.mjs  # 抓 OpenCode CLI 的真实请求
+node rust/tests/replay-gate-probe.mjs         # 对着真实上游逐项回放，定位门禁
 node selftest.mjs                  # 22 项：Node 版自测
 ```
 

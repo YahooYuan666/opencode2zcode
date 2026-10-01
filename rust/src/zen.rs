@@ -14,7 +14,8 @@ pub const OPENCODE_CLIENT_VERSION: &str = "1.18.31";
 
 const BASE62_ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-/// 实测：匿名通道对不流式、或缺 bash/read 函数工具的 chat 请求直接 403。
+/// 实测（2026-10-01 对真实上游逐项回放）：匿名通道对不流式、或缺 bash/read
+/// 函数工具的请求一律 403。chat 道与 responses 道都要有这两个工具。
 const FREE_LANE_GATE_TOOL_NAMES: [&str; 2] = ["bash", "read"];
 
 /// 上游确实会接受的「主动思考」档位。off/none 不在其中，见 effort 模块注释。
@@ -191,45 +192,86 @@ pub fn derive_request_ids_from_wire(body: &Value) -> RequestIds {
     }
 }
 
-fn free_lane_gate_tool(name: &str) -> Value {
+/// 门禁工具的描述与参数：描述和参数上游不检查，两种线格式统一用同一份文案。
+const GATE_DESCRIPTION: &str = "Reserved for the host runtime; do not call it.";
+
+/// chat/completions 的线格式：工具定义嵌在 `function` 里。
+fn free_lane_gate_tool_chat(name: &str) -> Value {
     json!({
         "type": "function",
         "function": {
             "name": name,
-            "description": "Reserved for the host runtime; do not call it.",
+            "description": GATE_DESCRIPTION,
             "parameters": { "type": "object", "properties": {} },
         }
     })
 }
 
-/// 补齐缺失的门禁工具。原本一个工具都没有时补 tool_choice:"none"，
-/// 免得模型真的去调这两个占位桩；宿主自带工具时不动它的 tool_choice。
-pub fn ensure_free_lane_shape(body: &Value) -> Value {
+/// responses 的线格式：**扁平**，`name` 直接挂在工具上。
+/// 套错格式会被上游判 400（`tools[0] missing required field name`）。
+fn free_lane_gate_tool_responses(name: &str) -> Value {
+    json!({
+        "type": "function",
+        "name": name,
+        "description": GATE_DESCRIPTION,
+        "parameters": { "type": "object", "properties": {} },
+    })
+}
+
+/// 补齐缺失的门禁工具。
+///
+/// chat 道：原本一个工具都没有时补 `tool_choice: "none"`，免得模型真去调这两个
+/// 占位桩。
+/// responses 道：**绝对不能碰 `tool_choice`**。上游那个端点只接受
+/// `"auto"` / `"required"` / 具体工具名，给 `"none"` 会直接 400
+/// （`only ... are supported`）。这是踩过的坑——最早判定「responses 道没救」
+/// 就是因为照搬了 chat 道的 `tool_choice: "none"`，而它恰好是致命的那个。
+pub fn ensure_free_lane_shape(body: &Value, lane: Lane) -> Value {
     let tools = body.get("tools").and_then(Value::as_array).cloned().unwrap_or_default();
-    let mut missing: Vec<&str> = Vec::new();
-    for gate in FREE_LANE_GATE_TOOL_NAMES {
-        let present = tools.iter().any(|tool| {
-            tool.get("function")
+    fn name_of<'a>(tool: &'a Value, lane: Lane) -> Option<&'a str> {
+        match lane {
+            // 两种线格式都要认，宿主或上游可能用了其中一种
+            Lane::Chat => tool
+                .get("function")
                 .and_then(|f| f.get("name"))
                 .and_then(Value::as_str)
-                == Some(gate)
-        });
-        if !present {
+                .or_else(|| tool.get("name").and_then(Value::as_str)),
+            Lane::Responses => tool
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    tool.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)
+                }),
+        }
+    }
+    let mut missing: Vec<&str> = Vec::new();
+    for gate in FREE_LANE_GATE_TOOL_NAMES {
+        if !tools.iter().any(|tool| name_of(tool, lane) == Some(gate)) {
             missing.push(gate);
         }
     }
-    if missing.is_empty() {
-        return body.clone();
-    }
     let mut next = body.as_object().cloned().unwrap_or_default();
-    let was_empty = tools.is_empty();
-    let mut merged = tools;
-    for name in missing {
-        merged.push(free_lane_gate_tool(name));
+
+    if !missing.is_empty() {
+        let was_empty = tools.is_empty();
+        let mut merged = tools;
+        for name in missing {
+            merged.push(match lane {
+                Lane::Chat => free_lane_gate_tool_chat(name),
+                Lane::Responses => free_lane_gate_tool_responses(name),
+            });
+        }
+        next.insert("tools".into(), Value::Array(merged));
+        if was_empty && lane == Lane::Chat {
+            next.insert("tool_choice".into(), Value::String("none".into()));
+        }
     }
-    next.insert("tools".into(), Value::Array(merged));
-    if was_empty {
-        next.insert("tool_choice".into(), Value::String("none".into()));
+
+    if lane == Lane::Responses {
+        // 宿主带过来的 "none" 同样要摘掉，否则必 400。
+        if next.get("tool_choice").and_then(Value::as_str) == Some("none") {
+            next.remove("tool_choice");
+        }
     }
     Value::Object(next)
 }
@@ -243,9 +285,16 @@ pub fn upstream_effort(host_value: Option<&str>) -> Option<&'static str> {
     ACCEPTED_EFFORT_LADDER.iter().find(|level| **level == raw).copied()
 }
 
-/// 把宿主发来的 chat 体整理成免费通道能收的形状：强制流式、透传受支持的
-/// 思考档位（否则不带这个字段）、再套门禁。其余原样转发。
-pub fn build_upstream_body(host_body: &Value) -> Value {
+/// 上游的两条线格式。门禁规则相同，但工具定义的形状和 `tool_choice` 的处理不同。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lane {
+    Chat,
+    Responses,
+}
+
+/// 把宿主发来的请求体整理成免费通道能收的形状：强制流式、透传受支持的思考档位
+/// （否则不带这个字段）、再套门禁。其余原样转发。
+pub fn build_upstream_body(host_body: &Value, lane: Lane) -> Value {
     let source = host_body.as_object().cloned().unwrap_or_default();
     let mut body: Map<String, Value> = source;
     body.insert("stream".into(), Value::Bool(true));
@@ -257,7 +306,7 @@ pub fn build_upstream_body(host_body: &Value) -> Value {
             body.insert("reasoning_effort".into(), Value::String(effort.into()));
         }
     }
-    ensure_free_lane_shape(&Value::Object(body))
+    ensure_free_lane_shape(&Value::Object(body), lane)
 }
 
 #[cfg(test)]
@@ -278,7 +327,7 @@ mod tests {
 
     #[test]
     fn 门禁工具被补齐且无工具时关掉调用() {
-        let body = build_upstream_body(&json!({ "model": "x" }));
+        let body = build_upstream_body(&json!({ "model": "x" }), Lane::Chat);
         let tools = body.get("tools").and_then(Value::as_array).unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(body.get("tool_choice").and_then(Value::as_str), Some("none"));
@@ -287,11 +336,14 @@ mod tests {
 
     #[test]
     fn 宿主自带工具时不动_tool_choice() {
-        let body = build_upstream_body(&json!({
-            "model": "x",
-            "tools": [{ "type": "function", "function": { "name": "bash" } }],
-            "tool_choice": "auto",
-        }));
+        let body = build_upstream_body(
+            &json!({
+                "model": "x",
+                "tools": [{ "type": "function", "function": { "name": "bash" } }],
+                "tool_choice": "auto",
+            }),
+            Lane::Chat,
+        );
         let tools = body.get("tools").and_then(Value::as_array).unwrap();
         assert_eq!(tools.len(), 2, "只补缺的 read");
         assert_eq!(body.get("tool_choice").and_then(Value::as_str), Some("auto"));

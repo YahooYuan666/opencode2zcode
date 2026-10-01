@@ -238,29 +238,50 @@ function deriveRequestIDsFromWire(body) {
 /** 实测：匿名通道对不流式、或缺 bash/read 函数工具的 chat 请求直接 403。 */
 const FREE_LANE_GATE_TOOL_NAMES = ['bash', 'read'];
 
-function freeLaneGateTool(name) {
+/** 门禁工具的描述与参数：描述和参数上游不检查，两种线格式统一用同一份文案。 */
+const GATE_DESCRIPTION = 'Reserved for the host runtime; do not call it.';
+
+/** chat/completions 的线格式：工具定义嵌在 `function` 里。 */
+function freeLaneGateToolChat(name) {
   return {
     type: 'function',
-    function: {
-      name,
-      description: 'Reserved for the host runtime; do not call it.',
-      parameters: { type: 'object', properties: {} },
-    },
+    function: { name, description: GATE_DESCRIPTION, parameters: { type: 'object', properties: {} } },
   };
 }
 
+/** responses 的线格式：**扁平**，`name` 直接挂在工具上。
+ *  套错格式会被上游判 400（tools[0] missing required field name）。 */
+function freeLaneGateToolResponses(name) {
+  return { type: 'function', name, description: GATE_DESCRIPTION, parameters: { type: 'object', properties: {} } };
+}
+
 /**
- * 补齐缺失的门禁工具。原本一个工具都没有时补 tool_choice:"none"，
- * 免得模型真的去调这两个占位桩；宿主自带工具时不动它的 tool_choice。
+ * 补齐缺失的门禁工具。
+ *
+ * chat 道：原本一个工具都没有时补 tool_choice:"none"，免得模型真去调这两个
+ * 占位桩。
+ * responses 道：**绝对不能碰 tool_choice**。那个端点只接受 "auto" /
+ * "required" / 具体工具名，给 "none" 会直接 400。踩过的坑——最早判定
+ * 「responses 道没救」就是因为照搬了 chat 道的 tool_choice:"none"，
+ * 而它恰好是致命的那个。
  */
-function ensureFreeLaneShape(body) {
+function ensureFreeLaneShape(body, lane) {
   const tools = Array.isArray(body.tools) ? body.tools : [];
-  const names = new Set(tools.map((tool) => (tool && tool.function && tool.function.name) || undefined));
+  const nameOf = (tool) => {
+    if (!tool || typeof tool !== 'object') return undefined;
+    if (lane === 'responses') return tool.name ?? (tool.function && tool.function.name);
+    return (tool.function && tool.function.name) ?? tool.name;
+  };
+  const names = new Set(tools.map(nameOf));
   const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !names.has(name));
-  if (missing.length === 0) return body;
   const next = { ...body };
-  next.tools = [...tools, ...missing.map(freeLaneGateTool)];
-  if (tools.length === 0) next.tool_choice = 'none';
+
+  if (missing.length > 0) {
+    const build = lane === 'responses' ? freeLaneGateToolResponses : freeLaneGateToolChat;
+    next.tools = [...tools, ...missing.map(build)];
+    if (tools.length === 0 && lane === 'chat') next.tool_choice = 'none';
+  }
+  if (lane === 'responses' && next.tool_choice === 'none') delete next.tool_choice;
   return next;
 }
 
@@ -306,7 +327,7 @@ function effortsFor(capability) {
  * 把宿主发来的 chat 体整理成免费通道能收的形状：强制流式、透传受支持的思考
  * 档位（否则不带这个字段）、再套门禁。其余原样转发。
  */
-function buildUpstreamBody(hostBody) {
+function buildUpstreamBody(hostBody, lane) {
   const source = hostBody && typeof hostBody === 'object' ? hostBody : {};
   const body = { ...source, stream: true };
   const effort = upstreamEffort(source.reasoning_effort);
@@ -315,7 +336,7 @@ function buildUpstreamBody(hostBody) {
   } else {
     body.reasoning_effort = effort;
   }
-  return ensureFreeLaneShape(body);
+  return ensureFreeLaneShape(body, lane);
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,8 +1155,10 @@ async function handleUpstream(req, res, upstreamPath) {
 
   // chat 道：强制流式 + 归一思考档位 + 补 bash/read 门禁工具。
   // responses 道：只强制流式，其余原样（muse-spark 由 Zen 自己的 /v1/responses 服务）。
+  // 两条道都要过同一道门禁（请求体里必须有 bash 和 read），但线格式不同：
+  // responses 的工具定义是扁平的，而且不能带 tool_choice。详见 ensureFreeLaneShape。
   const isResponsesLane = upstreamPath.endsWith('/responses');
-  const body = isResponsesLane ? { ...hostBody, stream: true } : buildUpstreamBody(hostBody);
+  const body = buildUpstreamBody(hostBody, isResponsesLane ? 'responses' : 'chat');
   const ids = deriveRequestIDsFromWire(body);
 
   const controller = new AbortController();
@@ -1644,7 +1667,7 @@ const HELP = `opencode2zcode — 把 OpenCode Zen 匿名免费模型接进 ZCode
   node zen-proxy.mjs --remove-provider   只从 ZCode 配置里摘掉本工具的两个 Provider
   node zen-proxy.mjs --port 41930        指定回环端口
   node zen-proxy.mjs --config <path>     直接指定 provider_config.json 完整路径
-  node zen-proxy.mjs --with-responses    连 responses 道那一组也写进配置（默认不写）
+  node zen-proxy.mjs --with-responses    兼容旧命令行（responses 组现在默认就写）
 
 装完就不用再管了：启动 ZCode 时会自动静默拉起代理，不会有任何窗口。
 人类用户直接双击 install-autostart.cmd 即可（它就是 --install 的壳）。
@@ -1758,10 +1781,7 @@ async function main() {
 
   function applyCatalog(currentPort, targetConfigPath) {
     state.chatModels = chatModelEntries(catalog);
-    // responses 道默认不暴露：OpenCode 的 /v1/responses 对外部调用一律 403
-    // （「免费档只允许在 OpenCode 内部使用」），是上游 provider 的限制，伪装请求头
-    // 过不去。写进配置只会让模型选择器里多一个点下去必报错的分组。
-    state.responsesModels = options.withResponses ? responsesModelEntries(catalog) : [];
+    state.responsesModels = responsesModelEntries(catalog);
     state.catalogStatus = catalog.snapshot();
     const existing = readExistingConfig(targetConfigPath);
     const config = buildZcodeConfig({
@@ -1778,7 +1798,7 @@ async function main() {
       existing: readExistingConfig(configPath),
       port,
       chatModels: chatModelEntries(catalog),
-      responsesModels: options.withResponses ? responsesModelEntries(catalog) : [],
+      responsesModels: responsesModelEntries(catalog),
     });
     console.error(`# 目标文件：${configPath}`);
     console.error('# 下面所有 apiKey 已脱敏；此模式不落盘、不起服务。');

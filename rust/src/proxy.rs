@@ -13,16 +13,11 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tiny_http::{Header, Response, Server};
 
-use crate::zen::{build_upstream_body, derive_request_ids_from_wire, disguise_headers, ANONYMOUS_KEY};
+use crate::zen::{build_upstream_body, derive_request_ids_from_wire, disguise_headers, Lane, ANONYMOUS_KEY};
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 /// 命中这些状态码且确实带了 reasoning_effort 时，摘掉该字段重试一次。
 const RETRY_WITHOUT_EFFORT_STATUSES: [u16; 3] = [400, 422, 500];
-
-/// responses 道调不通时回给用户的诊断。放在这里而不是散在注释里，是因为
-/// 这个结论是 2026-10 逐个组合实测出来的，很容易被下一个人「顺手修好」。
-pub const RESPONSES_LANE_NOTE: &str =
-    "OpenCode 的 /v1/responses 通道目前对外部调用一律拒绝（403：免费档只允许在      OpenCode 内部使用），这是上游 provider 的限制，本工具的请求头伪装过不去。     所以默认不会把这一组模型写进 ZCode 配置。";
 
 pub struct State {
     pub port: Mutex<u16>,
@@ -180,9 +175,10 @@ fn forward(
     upstream_path: &str,
     host_body: &Value,
 ) -> Result<Option<Response<Box<dyn Read + Send + 'static>>>, String> {
-    // chat 道：强制流式 + 归一思考档位 + 补 bash/read 门禁工具。responses 道在
-    // handle_request 里就已经短路掉了，走不到这里。
-    let body = build_upstream_body(host_body);
+    // 两条道都要：强制流式 + 归一思考档位 + 补 bash/read 门禁工具。
+    // 门禁规则相同，但工具定义的线格式不同、tool_choice 的处理不同，见 zen::Lane。
+    let lane = if upstream_path.ends_with("/responses") { Lane::Responses } else { Lane::Chat };
+    let body = build_upstream_body(host_body, lane);
     let ids = derive_request_ids_from_wire(&body);
 
     let client = crate::http::client()?;
@@ -274,17 +270,7 @@ pub fn handle_request(mut request: tiny_http::Request, state: &Arc<State>, zen_b
     }
 
     let upstream_path = if method == "POST" && path.ends_with("/responses") {
-        // responses 道对**所有**模型都不通（2026-10 实测）：
-        //   muse-spark-* 在这一道回 403「OpenCode's free tier can only be used from
-        //   within OpenCode」——它背后的 provider 要求请求真的来自 OpenCode 内部，
-        //   那不是伪造请求头能过的门禁；
-        //   而能过 chat 道门禁的模型在这一道又根本不存在（回 500 Internal error）。
-        // 补 bash/read 门禁工具、换 Responses 扁平工具格式，都试过，一律无效。
-        //
-        // 所以默认根本不往配置里写这个 provider（见 --with-responses）。真被调到时
-        // 给一句能看懂的诊断，好过把上游那句 403 原样甩给用户。
-        let _ = request.respond(json_response(501, &json!({ "error": { "message": RESPONSES_LANE_NOTE } })));
-        return;
+        "/v1/responses"
     } else if method == "POST" && path.ends_with("/chat/completions") {
         "/v1/chat/completions"
     } else {

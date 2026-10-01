@@ -52,13 +52,27 @@ const mock = http.createServer((req, res) => {
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
   req.on('end', () => {
-    received.push({ headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
-    // 分三块发，验证「逐块透传」而不是攒完一次性吐
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    received.push({ headers: req.headers, body });
     res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (req.url?.endsWith('/responses')) {
+      // Responses 方言：delta 事件 + completed 事件。故意让 completed 里不带
+      // output_text，逼代理用自己拼的文本兜底。
+      res.write(`data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'he' })}\n\n`);
+      setTimeout(() => {
+        res.write(`data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'llo' })}\n\n`);
+        setTimeout(() => {
+          res.write(`data: ${JSON.stringify({ type: 'response.completed', response: { id: 'resp_mock', object: 'response', status: 'completed', model: body.model, output: [] } })}\n\n`);
+          res.end('data: [DONE]\n\n');
+        }, 20);
+      }, 20);
+      return;
+    }
+    // chat 方言：分三块发，验证拼装/透传都不是攒完一次性吐
     res.write('data: {"choices":[{"delta":{"content":"he');
     setTimeout(() => {
       res.write('llo"}}]}\n\n');
-      setTimeout(() => res.end('data: [DONE]\n\n'), 30);
+      setTimeout(() => res.end('data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"total_tokens":3}}\n\ndata: [DONE]\n\n'), 30);
     }, 30);
   });
 });
@@ -142,8 +156,15 @@ try {
     }),
   });
   const text = await res.text();
-  check('SSE 内容原样透传', text.includes('"content":"hello"'), text.slice(0, 200));
-  check('SSE 结束标记也在', text.includes('[DONE]'));
+  // 客户端没要流式 → 应拼回单个 JSON（回归：此前无条件强制流式弄挂了 WebFetch）
+  let reassembled = null;
+  try { reassembled = JSON.parse(text); } catch {}
+  check('没要流式 → 拼回单个 chat.completion',
+    reassembled?.object === 'chat.completion', text.slice(0, 200));
+  check('内容拼全', reassembled?.choices?.[0]?.message?.content === 'hello',
+    JSON.stringify(reassembled?.choices?.[0]?.message));
+  check('finish_reason 取自末块', reassembled?.choices?.[0]?.finish_reason === 'stop');
+  check('usage 透传', reassembled?.usage?.total_tokens === 3);
   check('mock 收到了请求', received.length === 1);
   const h = received[0].headers;
   check('user-agent 自称 opencode CLI', /^opencode\//.test(String(h['user-agent'])), String(h['user-agent']));
@@ -187,10 +208,37 @@ try {
   });
   check('非回环 Host 被拒（403）', status === 403, `实际 ${status}`);
 
+  console.log('\n[5b] 客户端显式要流式 → 逐块透传（SSE 原样）');
+  received.length = 0;
+  const streamed = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'big-pickle', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const streamText = await streamed.text();
+  check('流式仍是 SSE 碎片（不被拼装破坏）',
+    streamText.includes('data:') && streamText.includes('[DONE]'), streamText.slice(0, 120));
+  check('流式内容分块透传', streamText.includes('"content":"he') && streamText.includes('llo'));
+
+  console.log('\n[5c] responses 道非流式 → 拼回完整 response 对象');
+  received.length = 0;
+  const respNs = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'muse-spark-1.3-contributor-free', stream: false, input: 'hi' }),
+  });
+  const respNsText = await respNs.text();
+  let respNsJson = null;
+  try { respNsJson = JSON.parse(respNsText); } catch {}
+  check('responses 非流式也是单个 JSON', respNsJson !== null, respNsText.slice(0, 160));
+  check('status=completed', respNsJson?.status === 'completed');
+  check('completed 缺 output_text 时用拼装文本兜底',
+    JSON.stringify(respNsJson?.output ?? '').includes('hello'), JSON.stringify(respNsJson).slice(0, 200));
+
   console.log('\n[5] 错误透传');
   received.length = 0;
   const after = await waitForHealth(port, 5);
-  check('healthz 累计了请求数（两次成功的 POST）', after && after.requests === 2, JSON.stringify(after));
+  check('healthz 累计了请求数', after && after.requests === 4, JSON.stringify(after));
 } finally {
   child.kill();
   mock.close();

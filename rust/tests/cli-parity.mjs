@@ -86,7 +86,8 @@ const rustModels = modelsOf(rustOut);
 check('两边模型数相同', nodeModels.length === rustModels.length, `Node ${nodeModels.length} vs Rust ${rustModels.length}`);
 check('两边模型集合完全一致', JSON.stringify(nodeModels) === JSON.stringify(rustModels),
   `Node: ${nodeModels.join(',')}\n      Rust: ${rustModels.join(',')}`);
-check('chat 道 7 个 + responses 道 1 个 = 8 个', rustModels.length === 8, `实际 ${rustModels.length} 个：${rustModels.join(',')}`);
+check('清单非空', rustModels.length > 0, `实际 ${rustModels.length} 个`);
+check('含 muse-spark（responses 道）', rustModels.some((m) => m.startsWith('muse-spark')));
 check(
   'responses 道的 muse-spark 在列',
   rustModels.some((m) => m.startsWith('muse-spark')),

@@ -5,7 +5,7 @@
 //! HTTP 解析交给 tiny_http 而不是自己手写——这是重写里最容易悄悄写错的地方，
 //! 能交给久经考验的实现就别自己来。
 
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -168,13 +168,21 @@ fn send_upstream(
     request.timeout(UPSTREAM_TIMEOUT).json(payload).send().map_err(|e| e.to_string())
 }
 
-/// 转发一次对话请求。返回 None 表示走流式（此时已经拿到可读流）。
+/// 上游的一次应答。流式与否由**客户端**决定，不由我们决定。
+enum Upstream {
+    /// 上游 2xx，返回的是 SSE 流（免费通道要求流式，这条不变）。
+    Stream(Box<dyn Read + Send + 'static>),
+    /// 非 2xx：把字节原样交回去。
+    Whole { status: u16, content_type: String, body: Vec<u8> },
+}
+
+/// 转发一次对话请求。
 fn forward(
     state: &State,
     zen_base_url: &str,
     upstream_path: &str,
     host_body: &Value,
-) -> Result<Option<Response<Box<dyn Read + Send + 'static>>>, String> {
+) -> Result<Upstream, String> {
     // 两条道都要：强制流式 + 归一思考档位 + 补 bash/read 门禁工具。
     // 门禁规则相同，但工具定义的线格式不同、tool_choice 的处理不同，见 zen::Lane。
     let lane = if upstream_path.ends_with("/responses") { Lane::Responses } else { Lane::Chat };
@@ -214,12 +222,7 @@ fn forward(
         let message = extract_error_message(&text, status);
         state.set_error(&message);
         eprintln!("[zen] {}", message.chars().take(200).collect::<String>());
-        let boxed: Box<dyn Read + Send + 'static> = Box::new(std::io::Cursor::new(text.into_bytes()));
-        let mut response = streaming_response(status, boxed);
-        if let Ok(header) = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()) {
-            response = response.with_header(header);
-        }
-        return Ok(Some(response));
+        return Ok(Upstream::Whole { status, content_type, body: text.into_bytes() });
     }
 
     let content_type = response
@@ -230,15 +233,7 @@ fn forward(
         .to_string();
     let status = response.status().as_u16();
     // reqwest 的 blocking Response 本身就实现 Read，直接拿来当流。
-    let boxed: Box<dyn Read + Send + 'static> = Box::new(response);
-    let mut out = streaming_response(status, boxed);
-    if let Ok(header) = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()) {
-        out = out.with_header(header);
-    }
-    if let Ok(header) = Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..]) {
-        out = out.with_header(header);
-    }
-    Ok(Some(out))
+    Ok(Upstream::Stream(Box::new(response)))
 }
 
 pub fn handle_request(mut request: tiny_http::Request, state: &Arc<State>, zen_base_url: &str) {
@@ -296,12 +291,40 @@ pub fn handle_request(mut request: tiny_http::Request, state: &Arc<State>, zen_b
     };
 
     state.requests.fetch_add(1, Ordering::Relaxed);
+    let wants_stream = host_body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let lane = if upstream_path.ends_with("/responses") { Lane::Responses } else { Lane::Chat };
+
     match forward(state, zen_base_url, upstream_path, &host_body) {
-        Ok(Some(response)) => {
-            let _ = request.respond(response);
+        Ok(Upstream::Stream(reader)) if wants_stream => {
+            // 客户端自己要流式：逐块透传（同一套方言，不重编码）。
+            let boxed: Box<dyn Read + Send + 'static> = Box::new(CursorPassthrough(reader));
+            let mut out = streaming_response(200, boxed);
+            if let Ok(header) = Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..]) {
+                out = out.with_header(header);
+            }
+            if let Ok(header) = Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..]) {
+                out = out.with_header(header);
+            }
+            let _ = request.respond(out);
         }
-        Ok(None) => {
-            let _ = request.respond(json_response(500, &json!({ "error": { "message": "no upstream stream" } })));
+        Ok(Upstream::Stream(reader)) => {
+            // 客户端要非流式：上游仍是流式（免费通道要求），我们在中间拼回完整 JSON。
+            let payload = match lane {
+                Lane::Chat => reassemble_chat_sse(reader),
+                Lane::Responses => {
+                    let model = host_body.get("model").and_then(Value::as_str).unwrap_or_default().to_string();
+                    reassemble_responses_sse(reader, &model)
+                }
+            };
+            let _ = request.respond(json_response(200, &payload));
+        }
+        Ok(Upstream::Whole { status, content_type, body }) => {
+            let boxed: Box<dyn Read + Send + 'static> = Box::new(std::io::Cursor::new(body));
+            let mut response = streaming_response(status, boxed);
+            if let Ok(header) = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()) {
+                response = response.with_header(header);
+            }
+            let _ = request.respond(response);
         }
         Err(message) => {
             state.set_error(&message);
@@ -312,9 +335,155 @@ pub fn handle_request(mut request: tiny_http::Request, state: &Arc<State>, zen_b
     }
 }
 
+/// 透传包装：把 Box<dyn Read> 包成 Read + Send + 'static 的具体类型。
+struct CursorPassthrough(Box<dyn Read + Send>);
+impl Read for CursorPassthrough {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
 /// 绑定端口。**只负责绑，不负责 accept**——accept 循环是死循环，混在一起的话
 /// 调用方永远拿不到端口，后面的配置同步就全成了死代码。
 /// 优先绑固定候选端口，这样写进配置的 baseUrl 才稳定。
+/// 把上游的 chat SSE 流拼回一个完整的非流式 chat.completion。
+///
+/// 免费通道要求请求必须是流式的，但客户端（ZCode 的 WebFetch 等）发来的
+/// 可能是非流式请求。此前把流式碎片原样甩回去，客户端按 JSON 解析直接
+/// 失败——这就是「所有免费模型的 WebFetch 全挂」的根因。
+fn reassemble_chat_sse(reader: Box<dyn Read + Send>) -> Value {
+    let mut id = String::new();
+    let mut created: i64 = 0;
+    let mut model = String::new();
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut finish_reason = String::new();
+    let mut usage: Option<Value> = None;
+
+    for line in BufReader::new(reader).lines() {
+        let Ok(line) = line else { break };
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue };
+        if id.is_empty() {
+            id = chunk.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+            created = chunk.get("created").and_then(Value::as_i64).unwrap_or(0);
+            model = chunk.get("model").and_then(Value::as_str).unwrap_or_default().to_string();
+        }
+        if let Some(delta) = chunk.pointer("/choices/0/delta") {
+            if let Some(piece) = delta.get("content").and_then(Value::as_str) {
+                content.push_str(piece);
+            }
+            if let Some(piece) = delta.get("reasoning").and_then(Value::as_str) {
+                reasoning.push_str(piece);
+            }
+        }
+        if let Some(fr) = chunk.pointer("/choices/0/finish_reason").and_then(Value::as_str) {
+            if !fr.is_empty() {
+                finish_reason = fr.to_string();
+            }
+        }
+        if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
+            usage = Some(u.clone());
+        }
+    }
+    // 有的模型把全部输出都放进 reasoning 字段；content 为空时拿它顶上，
+    // 否则非流式客户端只会看到一个空回复。
+    if content.is_empty() && !reasoning.is_empty() {
+        content = reasoning.clone();
+    }
+    let mut message = json!({ "role": "assistant", "content": content });
+    if !reasoning.is_empty() && !content.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning);
+    }
+    let mut out = json!({
+        "id": if id.is_empty() { "chatcmpl-proxy".to_string() } else { id },
+        "object": "chat.completion",
+        "created": if created == 0 { now_secs() } else { created },
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": if finish_reason.is_empty() { "stop" } else { finish_reason.as_str() },
+        }],
+    });
+    if let Some(u) = usage {
+        out["usage"] = u;
+    }
+    out
+}
+
+/// 把上游的 responses SSE 流拼回一个完整的 response 对象。
+fn reassemble_responses_sse(reader: Box<dyn Read + Send>, model: &str) -> Value {
+    let mut text = String::new();
+    let mut completed: Option<Value> = None;
+
+    for line in BufReader::new(reader).lines() {
+        let Ok(line) = line else { break };
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else { continue };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(piece) = event.get("delta").and_then(Value::as_str) {
+                    text.push_str(piece);
+                }
+            }
+            Some("response.completed") => {
+                completed = event.get("response").cloned();
+            }
+            _ => {}
+        }
+    }
+    if let Some(mut response) = completed {
+        // 上游给的是权威完整对象；把拼出来的文本兜底进去（有些上游不发
+        // output_text，只发 delta）。
+        if let Some(arr) = response.get_mut("output").and_then(Value::as_array_mut) {
+            let has_text = arr.iter().any(|item| {
+                item.get("content")
+                    .and_then(Value::as_array)
+                    .map(|parts| {
+                        parts.iter().any(|p| p.get("type").and_then(Value::as_str) == Some("output_text"))
+                    })
+                    .unwrap_or(false)
+            });
+            if !has_text {
+                arr.push(json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{ "type": "output_text", "text": text }],
+                }));
+            }
+        }
+        return response;
+    }
+    json!({
+        "id": format!("resp_proxy_{}", now_secs()),
+        "object": "response",
+        "created_at": now_secs(),
+        "status": "completed",
+        "model": model,
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{ "type": "output_text", "text": text }],
+        }],
+    })
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 pub fn bind(state: &Arc<State>, candidates: &[u16]) -> Result<(Server, u16), String> {
     let mut last_error = String::new();
     for port in candidates {
@@ -379,5 +548,26 @@ mod tests {
         let health = build_health(&state);
         assert_eq!(health["chatModels"], 2);
         assert_eq!(health["ok"], true);
+    }
+}
+
+#[cfg(test)]
+mod reassemble_tests {
+    use super::*;
+
+    #[test]
+    fn chat_sse_拼装_分块到达也能拼全() {
+        // 完全复刻 mock 的发送方式：第一块没有换行结尾，第二块补完
+        let raw = b"data: {\"choices\":[{\"delta\":{\"content\":\"he";
+        let raw2 = b"llo\"}}]}\n\n";
+        let raw3 = b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":3}}\n\ndata: [DONE]\n\n";
+        let mut all = Vec::new();
+        all.extend_from_slice(raw);
+        all.extend_from_slice(raw2);
+        all.extend_from_slice(raw3);
+        let out = reassemble_chat_sse(Box::new(std::io::Cursor::new(all)));
+        assert_eq!(out["choices"][0]["message"]["content"], "hello", "内容应拼全: {}", out);
+        assert_eq!(out["choices"][0]["finish_reason"], "stop");
+        assert_eq!(out["usage"]["total_tokens"], 3);
     }
 }

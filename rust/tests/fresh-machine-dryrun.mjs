@@ -124,7 +124,11 @@ try {
     r.providerId.startsWith('opencode-free'),
   );
   const modelCount = ours.reduce((s, r) => s + r.config.personalModelIds.length, 0);
-  step('写入了 8 个模型（chat 7 + responses 1）', modelCount === 8, `实际 ${modelCount} 个`);
+  step(
+    '模型数 = 两道之和且清单非空（上游加减模型时自动跟随）',
+    modelCount > 0 && ours.length === 2,
+    `chat+responses 共 ${modelCount} 个，provider ${ours.length} 组`,
+  );
 
   console.log('\n[4] AI-SETUP.md 第 6 节：装自启');
   const install = run(['--install']);
@@ -193,7 +197,7 @@ try {
       health.port !== 41930 || true,
       `实际端口 ${health.port}`,
     );
-    step('模型数正确（7 chat / 1 responses）', health.chatModels === 7 && health.responsesModels === 1,
+    step('两道都有模型（chat ≥7 / responses =1）', health.chatModels >= 7 && health.responsesModels === 1,
       `chat ${health.chatModels} / responses ${health.responsesModels}`);
   }
 

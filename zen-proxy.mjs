@@ -1218,6 +1218,21 @@ async function handleUpstream(req, res, upstreamPath) {
       return;
     }
 
+    // 免费通道要求请求必须流式，但客户端不一定想要流式响应。客户端没要流式时
+    // 在中间把 SSE 拼回完整 JSON——否则非流式调用方（ZCode 的 WebFetch 等）
+    // 拿到一串 data: 碎片，按 JSON 解析直接失败。
+    const wantsStream = hostBody?.stream === true;
+
+    if (!wantsStream) {
+      const raw = await response.text();
+      const payload = isResponsesLane
+          ? reassembleResponsesSse(raw, hostBody?.model)
+          : reassembleChatSse(raw);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(payload));
+      return;
+    }
+
     // SSE 逐块透传：两端都是同一套方言，不需要重编码，流式零损耗。
     res.writeHead(response.status, {
       'Content-Type': response.headers.get('content-type') || 'text/event-stream',
@@ -1245,6 +1260,106 @@ async function handleUpstream(req, res, upstreamPath) {
       res.end();
     }
   }
+}
+
+/**
+ * 把上游的 chat SSE 文本拼回完整的非流式 chat.completion。
+ * 免费通道要求请求流式，但客户端（ZCode 的 WebFetch 等）发来的可能是
+ * 非流式请求——此前把碎片原样甩回去，客户端按 JSON 解析直接失败。
+ */
+function reassembleChatSse(raw) {
+  let content = '';
+  let reasoning = '';
+  let finishReason = '';
+  let usage = null;
+  for (const line of String(raw ?? '').split('\n')) {
+    if (!line.startsWith('data:')) continue;
+    const data = line.slice(5).trim();
+    if (data === '' || data === '[DONE]') continue;
+    let chunk;
+    try {
+      chunk = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    const delta = chunk?.choices?.[0]?.delta;
+    if (delta) {
+      if (typeof delta.content === 'string') content += delta.content;
+      if (typeof delta.reasoning === 'string') reasoning += delta.reasoning;
+    }
+    const fr = chunk?.choices?.[0]?.finish_reason;
+    if (typeof fr === 'string' && fr.length > 0) finishReason = fr;
+    if (chunk?.usage && typeof chunk.usage === 'object') usage = chunk.usage;
+  }
+  // 有的模型把全部输出都放进 reasoning 字段；content 为空时拿它顶上，
+  // 否则非流式客户端只会看到一个空回复。
+  if (content === '' && reasoning !== '') content = reasoning;
+  const message = { role: 'assistant', content };
+  if (reasoning !== '' && content !== '') message.reasoning_content = reasoning;
+  const payload = {
+    id: 'chatcmpl-proxy',
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: '',
+    choices: [{ index: 0, message, finish_reason: finishReason === '' ? 'stop' : finishReason }],
+  };
+  if (usage) payload.usage = usage;
+  return payload;
+}
+
+/** 把上游的 responses SSE 文本拼回完整的 response 对象。 */
+function reassembleResponsesSse(raw, model) {
+  let text = '';
+  let completed = null;
+  for (const line of String(raw ?? '').split('\n')) {
+    if (!line.startsWith('data:')) continue;
+    const data = line.slice(5).trim();
+    if (data === '' || data === '[DONE]') continue;
+    let event;
+    try {
+      event = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    if (event?.type === 'response.output_text.delta' && typeof event.delta === 'string') {
+      text += event.delta;
+    } else if (event?.type === 'response.completed' && event.response) {
+      completed = event.response;
+    }
+  }
+  if (completed) {
+    // 上游给的是权威完整对象；把拼出来的文本兜底进去（有些上游不发
+    // output_text，只发 delta）。
+    const output = Array.isArray(completed.output) ? completed.output : [];
+    const hasText = output.some((item) =>
+      Array.isArray(item?.content) && item.content.some((p) => p?.type === 'output_text'),
+    );
+    if (!hasText) {
+      output.push({
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text }],
+      });
+    }
+    completed.output = output;
+    return completed;
+  }
+  return {
+    id: `resp_proxy_${Math.floor(Date.now() / 1000)}`,
+    object: 'response',
+    created_at: Math.floor(Date.now() / 1000),
+    status: 'completed',
+    model: model ?? '',
+    output: [
+      {
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text }],
+      },
+    ],
+  };
 }
 
 function handleRequest(req, res) {

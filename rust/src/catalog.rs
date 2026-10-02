@@ -295,7 +295,10 @@ impl ModelCatalog {
     }
 
     fn seed_from_cache(&mut self) {
-        if self.seeded {
+        // 种子失败（缓存损坏/缺失）不判死刑：prices 始终为空的进程是「中毒」的，
+        // 会一辈子写出没有思考档位的裸配置。没拿到元数据就把标记撤掉，
+        // 让下一次 5 分钟刷新重试。
+        if self.seeded && self.prices_ready {
             return;
         }
         self.seeded = true;
@@ -353,7 +356,9 @@ impl ModelCatalog {
 
     fn save_cache(&mut self) {
         let Some(path) = self.cache_path.clone() else { return };
-        if self.zen.is_empty() && self.prices.is_empty() {
+        // 空prices 覆盖好缓存 = 自我中毒循环：本次种子失败→把好缓存写坏→
+        // 之后每次重启都从坏缓存种子→永远好不了。没有元数据就别动缓存。
+        if self.prices.is_empty() {
             return;
         }
         let fingerprint = self.fingerprint();
@@ -500,10 +505,27 @@ impl ModelCatalog {
         metadata
     }
 
-    /// 暴露的 id：S1 ∩ 允许；S1 还没到时用静态实测清单。
+    /// 暴露的 id：S1 ∩ 允许；元数据缺失时**只**用静态实测清单。
+    ///
+    /// 元数据不可用时（models.dev 拉不到且缓存也没种子上），不能退回
+    /// 「名字带 free 就放行」——那会把目录里标了已下架的模型一起放进来
+    /// （点下去必报错），还会让所有条目退化成没有思考档位的裸默认值。
+    /// 2026-10-02 的「思考等级调不了」事故就是这条路径：宁可少暴露，
+    /// 也不暴露没核实过的。
     pub fn list(&self) -> Vec<String> {
         if self.zen.is_empty() {
             let mut out: Vec<String> = STATIC_FREE_MODELS.iter().map(|s| s.to_string()).collect();
+            out.sort();
+            return out;
+        }
+        if !self.prices_ready {
+            // 元数据没就绪：只暴露实测过的那几个，且必须还在实时清单里。
+            let mut out: Vec<String> = self
+                .zen
+                .iter()
+                .filter(|m| STATIC_FREE_MODELS.contains(&m.as_str()))
+                .cloned()
+                .collect();
             out.sort();
             return out;
         }
@@ -670,5 +692,93 @@ mod tests {
         // 声明为空时给默认阶梯
         let empty = Price { reasoning: true, ..Default::default() };
         assert_eq!(efforts_for(Some(&empty)).len(), DEFAULT_EFFORT_LADDER.len());
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    #[test]
+    fn 真实缓存文件能种子出完整元数据() {
+        let path = "D:/Program/.zcode/v2/opencode2zcode-catalog.json";
+        if !Path::new(path).exists() {
+            return; // 机器上没有缓存就跳过
+        }
+        let mut catalog = ModelCatalog::new(Some(PathBuf::from(path)));
+        // 只触发种子，不打网络：直接调内部的 seed 逻辑等价物
+        catalog.seed_from_cache();
+        assert!(catalog.prices_ready, "缓存里有 prices，seed 后 prices_ready 必须为 true");
+        let sb = catalog.metadata("space-bunny-free");
+        assert!(sb.is_some(), "space-bunny-free 应该在缓存里");
+        let sb = sb.unwrap();
+        assert_eq!(sb.context_window, 1048576.0, "缓存里的完整值应被读出，实际: {:?}", sb);
+        assert_eq!(sb.effort_values.len(), 5, "space-bunny 应有 5 个档位");
+        // 已下架模型必须带 deprecated 标记
+        let dead = catalog.metadata("mimo-v2.5-free");
+        assert!(dead.map(|p| p.deprecated).unwrap_or(false), "缓存里 mimo-v2.5-free 应标 deprecated");
+    }
+}
+
+#[cfg(test)]
+mod outage_tests {
+    use super::*;
+
+    #[test]
+    fn 元数据缺失时只暴露实测清单_不放_DEPRECATED() {
+        let mut catalog = ModelCatalog::new(None);
+        // 模拟事故现场：实时清单在（zen 有值），元数据一个都没有
+        catalog.zen = [
+            "big-pickle",
+            "mimo-v2.5-free",       // 目录里已下架，但名字带 free
+            "deepseek-v4-flash-free", // 同上
+            "made-up-future-free",  // 上游新加的、谁也没核实过的
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // prices_ready = false（默认）
+        let list = catalog.list();
+        assert_eq!(list, vec!["big-pickle".to_string()], "只该暴露实测过的: {:?}", list);
+    }
+
+    #[test]
+    fn 空prices绝不写缓存() {
+        let dir = std::env::temp_dir().join("o2z-cache-guard");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("cache.json");
+        // 先放一份好缓存
+        std::fs::write(
+            &path,
+            r#"{"version":1,"updatedAt":1,"zen":["big-pickle"],"prices":[["big-pickle",{"input":0,"output":0,"deprecated":false,"reasoning":true,"contextWindow":1,"maxTokens":1,"modalitiesInput":[],"effortValues":[]}]]}"#,
+        )
+        .unwrap();
+        let mut catalog = ModelCatalog::new(Some(path.clone()));
+        catalog.refresh_once("http://127.0.0.1:1"); // 两个源都不可达
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("\"prices\":[[") , "好缓存不许被空prices覆盖: {}", after);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed失败后下次刷新会重试() {
+        // 直接测 seed 语义本身，不碰网络（refresh_once 里的 models.dev 是
+        // 真实地址，可达与否随网络波动，不适合做断言依据）。
+        let dir = std::env::temp_dir().join("o2z-seed-retry");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("cache.json");
+        std::fs::write(&path, "not json at all").unwrap(); // 坏缓存
+        let mut catalog = ModelCatalog::new(Some(path.clone()));
+        catalog.seed_from_cache();
+        assert!(!catalog.prices_ready, "坏缓存不应种子出元数据");
+        // 模拟坏缓存被修好（比如另一个健康实例写回了好数据）
+        std::fs::write(
+            &path,
+            r#"{"version":1,"updatedAt":1790863206330,"zen":["big-pickle"],"prices":[["big-pickle",{"input":0,"output":0,"deprecated":false,"reasoning":true,"contextWindow":1,"maxTokens":1,"modalitiesInput":[],"effortValues":[]}]]}"#,
+        )
+        .unwrap();
+        catalog.seed_from_cache();
+        assert!(catalog.prices_ready, "seed 失败不该判死刑，下次要重试");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

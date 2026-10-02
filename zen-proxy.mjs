@@ -502,7 +502,9 @@ class ModelCatalog {
 
   /** 先读盘播种，离线启动也能保住上次的真实清单，不退化成静态兜底。 */
   #seedFromCache() {
-    if (this.#cacheSeeded) return;
+    // 种子失败不判死刑：prices 始终为空的进程会一辈子写出没有思考档位的
+    // 裸配置。没拿到元数据就撤掉标记，让下一次刷新重试（与 Rust 版一致）。
+    if (this.#cacheSeeded && this.#pricesReady) return;
     this.#cacheSeeded = true;
     if (!this.#cachePath) return;
     let raw = null;
@@ -540,7 +542,9 @@ class ModelCatalog {
   /** 只有数据真的变了才落盘，避免每 5 分钟白写一次。 */
   #saveCache() {
     if (!this.#cachePath) return;
-    if (this.#zen.size === 0 && this.#prices.size === 0) return;
+    // 空 prices 覆盖好缓存 = 自我中毒循环：种子失败→写坏缓存→以后每次重启
+    // 都从坏缓存种子。没有元数据就别动缓存（与 Rust 版一致）。
+    if (this.#prices.size === 0) return;
     const fingerprint = this.#cacheFingerprint();
     if (this.#cacheState && this.#cacheState.fingerprint === fingerprint) return;
     try {
@@ -644,9 +648,16 @@ class ModelCatalog {
     return metadata;
   }
 
-  /** 暴露的 id：S1 ∩ 允许；S1 还没到时用静态实测清单。 */
+  /**
+   * 暴露的 id：S1 ∩ 允许；元数据缺失时**只**用静态实测清单。
+   * 「名字带 free 就放行」会把已下架模型放进来（点下去必报错），还会让
+   * 条目退化成没有思考档位的裸默认值——2026-10-02 事故的根源。宁可少暴露。
+   */
   list() {
     if (this.#zen.size === 0) return STATIC_FREE_MODELS.slice().sort();
+    if (!this.#pricesReady) {
+      return [...this.#zen].filter((model) => STATIC_FREE_MODELS.includes(model)).sort();
+    }
     const out = [];
     for (const model of this.#zen) {
       if (this.decision(model).allowed) out.push(model);
@@ -1891,9 +1902,6 @@ async function main() {
     applyCatalog(port, configPath);
   }, { cachePath });
 
-  // 写配置前先读盘播种，离线启动也能写出真实清单（而不是缩水的静态兜底）。
-  await catalog.refreshOnce();
-
   function applyCatalog(currentPort, targetConfigPath) {
     state.chatModels = chatModelEntries(catalog);
     state.responsesModels = responsesModelEntries(catalog);
@@ -1906,6 +1914,14 @@ async function main() {
       responsesModels: state.responsesModels,
     });
     rewriteConfig(targetConfigPath, config);
+  }
+
+  // 一次性命令先拉目录（离线时也用缓存种子写出真实清单，而不是缩水兜底）。
+  // 服务模式则先绑端口再拉目录：models.dev 不可达时一次刷新要等 30 秒超时，
+  // 让 ZCode 的启动钩子干等是不合理的——端口先开（healthz 应答 pending），
+  // 目录随后补齐。与 Rust 版行为一致。
+  if (options.mode === 'print' || options.mode === 'write') {
+    await catalog.refreshOnce();
   }
 
   if (options.mode === 'print') {
@@ -1950,6 +1966,7 @@ async function main() {
   state.port = port;
   console.log(`[zen] 回环代理已监听 127.0.0.1:${port}`);
 
+  await catalog.refreshOnce();
   applyCatalog(port, configPath);
   console.log(`[zen] 已同步 ZCode 配置：${configPath}`);
   console.log(`[zen] chat ${state.chatModels.length} 个 / responses ${state.responsesModels.length} 个模型`);

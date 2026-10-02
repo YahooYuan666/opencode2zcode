@@ -33,7 +33,7 @@ const CHAT_LEVELS: &[&str] = &["minimal", "low", "medium", "high"];
 const SPACE_BUNNY_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const MUSE_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
 
-pub const BOOTSTRAP: [BootstrapEntry; 8] = [
+pub const BOOTSTRAP: [BootstrapEntry; 9] = [
     BootstrapEntry { id: "big-pickle", context_window: 200000.0, max_tokens: 32000.0, supports_images: false, thinking_levels: CHAT_LEVELS },
     BootstrapEntry { id: "ling-3.0-flash-fin-free", context_window: 262144.0, max_tokens: 32768.0, supports_images: false, thinking_levels: CHAT_LEVELS },
     BootstrapEntry { id: "longcat-2.5-preview-free", context_window: 1000000.0, max_tokens: 131072.0, supports_images: true, thinking_levels: CHAT_LEVELS },
@@ -42,6 +42,8 @@ pub const BOOTSTRAP: [BootstrapEntry; 8] = [
     BootstrapEntry { id: "nemotron-3.5-lightning-free", context_window: 262144.0, max_tokens: 262144.0, supports_images: false, thinking_levels: CHAT_LEVELS },
     BootstrapEntry { id: "space-bunny-free", context_window: 1048576.0, max_tokens: 524288.0, supports_images: true, thinking_levels: SPACE_BUNNY_LEVELS },
     BootstrapEntry { id: "fledge-alpha-free", context_window: 1048576.0, max_tokens: 131072.0, supports_images: true, thinking_levels: &["low", "high", "max"] },
+    // responses 道的 muse 也一样要兜底（Node 版有、这里先前漏了）
+    BootstrapEntry { id: "muse-spark-1.3-contributor-free", context_window: 1048576.0, max_tokens: 131072.0, supports_images: true, thinking_levels: &["minimal", "low", "medium", "high", "xhigh"] },
 ];
 
 /// muse-spark-* 只答 /v1/responses，jev-* 只答 /systemone，都不能进 chat 那条道。

@@ -97,35 +97,6 @@ const CACHE_FILE_NAME = 'opencode2zcode-catalog.json';
  * 断网兜底清单：2026-10-01 对 models.dev 实时核对，等于桌面版当前那 8 个
  * 「免费且未下架」的模型。联网成功后由实时目录取代，这里只在 S1 拿不到时用。
  */
-const STATIC_FREE_MODELS = [
-  'big-pickle',
-  'ling-3.0-flash-fin-free',
-  'longcat-2.5-preview-free',
-  'mimo-v2.6-flash-free',
-  'muse-spark-1.3-contributor-free',
-  'nemotron-3-ultra-free',
-  'nemotron-3.5-lightning-free',
-  'space-bunny-free',
-];
-
-const CHAT_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high'];
-const SPACE_BUNNY_THINKING_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
-const MUSE_THINKING_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
-
-/** 首启引导用的静态元数据（models.dev 实测值，2026-10）。 */
-const BOOTSTRAP_MODELS = [
-  { id: 'big-pickle', contextWindow: 200000, maxTokens: 32000, supportsImages: false, thinkingLevels: CHAT_THINKING_LEVELS },
-  { id: 'ling-3.0-flash-fin-free', contextWindow: 262144, maxTokens: 32768, supportsImages: false, thinkingLevels: CHAT_THINKING_LEVELS },
-  { id: 'longcat-2.5-preview-free', contextWindow: 1000000, maxTokens: 131072, supportsImages: true, thinkingLevels: CHAT_THINKING_LEVELS },
-  { id: 'mimo-v2.6-flash-free', contextWindow: 200000, maxTokens: 32000, supportsImages: true, thinkingLevels: CHAT_THINKING_LEVELS },
-  { id: 'nemotron-3-ultra-free', contextWindow: 1000000, maxTokens: 128000, supportsImages: false, thinkingLevels: CHAT_THINKING_LEVELS },
-  { id: 'nemotron-3.5-lightning-free', contextWindow: 262144, maxTokens: 262144, supportsImages: false, thinkingLevels: CHAT_THINKING_LEVELS },
-  { id: 'space-bunny-free', contextWindow: 1048576, maxTokens: 524288, supportsImages: true, thinkingLevels: SPACE_BUNNY_THINKING_LEVELS },
-];
-
-const BOOTSTRAP_RESPONSES_MODELS = [
-  { id: 'muse-spark-1.3-contributor-free', contextWindow: 1048576, maxTokens: 131072, supportsImages: true, thinkingLevels: MUSE_THINKING_LEVELS },
-];
 
 // ---------------------------------------------------------------------------
 // 关联 id + 伪装头（对应 ids.ts）
@@ -489,6 +460,9 @@ class ModelCatalog {
   #updatedAt = 0;
   #prices = new Map();
   #pricesReady = false;
+  /** 最近一次成功解析出来的清单与价格（内存快照）。编译期名单已移除。 */
+  #lastGoodZen = new Set();
+  #lastGoodPrices = new Map();
   #lastError = '';
   #timer = null;
   #stopped = false;
@@ -642,22 +616,24 @@ class ModelCatalog {
     // 目录已明确判定废弃时，S3 静态清单不再把它捞回来——那正是早先多出
     // mimo-v2.5-free / muse-spark-1.2-contributor-free 的原因。S3 只兜「还说不准」。
     if (metadata.source === 'metadata_deprecated') return metadata;
-    if (!metadata.known && STATIC_FREE_MODELS.includes(model)) {
+    if (!metadata.known && this.#lastGoodZen.has(model)) {
       return { allowed: true, source: 'static_verified', known: false };
     }
     return metadata;
   }
 
   /**
-   * 暴露的 id：S1 ∩ 允许；元数据缺失时**只**用静态实测清单。
-   * 「名字带 free 就放行」会把已下架模型放进来（点下去必报错），还会让
-   * 条目退化成没有思考档位的裸默认值——2026-10-02 事故的根源。宁可少暴露。
+   * 暴露的 id：S1 ∩ 允许；数据不可用时用**最近一次成功解析的结果**。
+   * 「名字带 free 就放行」会把已下架模型放进来（点下去必报错）——宁可少暴露。
+   * 编译期写死的名单已移除：它随上游增减而陈旧，正是要消除的那类误导。
    */
   list() {
-    if (this.#zen.size === 0) return STATIC_FREE_MODELS.slice().sort();
+    if (this.#zen.size === 0) return [...this.#lastGoodZen].sort();
     if (!this.#pricesReady) {
-      return [...this.#zen].filter((model) => STATIC_FREE_MODELS.includes(model)).sort();
+      // 元数据缺失：只保留"上次成功解析过、且此刻仍在实时清单里"的。
+      return [...this.#zen].filter((m) => this.#lastGoodZen.has(m)).sort();
     }
+
     const out = [];
     for (const model of this.#zen) {
       if (this.decision(model).allowed) out.push(model);
@@ -698,12 +674,16 @@ function isChatLaneModel(id) {
   return value.length > 0 && !value.startsWith('muse-spark') && !value.startsWith('jev');
 }
 
-/** models.dev 元数据 → 声明条目；缺元数据时用引导条目，绝不退化成裸默认值。 */
+/**
+ * models.dev 元数据 → 声明条目。
+ *
+ * 元数据拿不到时给中性默认。这里**不**放编译期写死的实测表——那份表会随上游增减
+ * 而陈旧，写进代码等于让程序永远按某个历史快照说话。真实档位来自上游的
+ * reasoning_options，写死一份反而会在上游改档位时变成误导。
+ */
 function catalogEntry(id, catalog) {
   const meta = catalog.metadata(id);
   if (!meta) {
-    const fallback = [...BOOTSTRAP_MODELS, ...BOOTSTRAP_RESPONSES_MODELS].find((m) => m.id === id);
-    if (fallback) return { ...fallback };
     return { id, contextWindow: 262144, maxTokens: 32768, supportsImages: false, thinkingLevels: [] };
   }
   return {

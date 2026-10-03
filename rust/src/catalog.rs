@@ -9,19 +9,6 @@ use std::time::{Duration, SystemTime};
 
 use crate::zen::{opencode_user_agent, ACCEPTED_EFFORT_LADDER, ANONYMOUS_KEY};
 
-/// 断网兜底清单：2026-10-01 对 models.dev 实时核对，等于桌面版当前那 8 个
-/// 「免费且未下架」的模型。联网成功后由实时目录取代。
-pub const STATIC_FREE_MODELS: [&str; 8] = [
-    "big-pickle",
-    "ling-3.0-flash-fin-free",
-    "longcat-2.5-preview-free",
-    "mimo-v2.6-flash-free",
-    "muse-spark-1.3-contributor-free",
-    "nemotron-3-ultra-free",
-    "nemotron-3.5-lightning-free",
-    "space-bunny-free",
-];
-
 pub const DEFAULT_EFFORT_LADDER: [&str; 4] = ["minimal", "low", "medium", "high"];
 
 const CACHE_TTL_MS: u128 = 7 * 24 * 60 * 60 * 1000;
@@ -260,6 +247,10 @@ pub struct Snapshot {
 
 pub struct ModelCatalog {
     cache_path: Option<PathBuf>,
+    /// 最近一次**成功**解析出来的清单与价格（内存快照）。
+    /// 拿不到任何数据源时用它顶上——这是"最近一次更新的结果"，不是编译期名单。
+    last_good_zen: BTreeSet<String>,
+    last_good_prices: BTreeMap<String, Price>,
     zen: BTreeSet<String>,
     prices: BTreeMap<String, Price>,
     prices_ready: bool,
@@ -282,6 +273,8 @@ impl ModelCatalog {
     pub fn new(cache_path: Option<PathBuf>) -> Self {
         Self {
             cache_path,
+            last_good_zen: BTreeSet::new(),
+            last_good_prices: BTreeMap::new(),
             zen: BTreeSet::new(),
             prices: BTreeMap::new(),
             prices_ready: false,
@@ -337,6 +330,7 @@ impl ModelCatalog {
             }
             if !map.is_empty() {
                 self.prices = map;
+                self.last_good_prices = self.prices.clone();
                 self.prices_ready = true;
             }
         }
@@ -477,6 +471,7 @@ impl ModelCatalog {
                     }
                 } else {
                     self.prices = prices;
+                    self.last_good_prices = self.prices.clone();
                     self.prices_ready = true;
                     self.live_at_ms = now_ms();
                 }
@@ -499,7 +494,7 @@ impl ModelCatalog {
         if metadata.source == "metadata_deprecated" {
             return metadata;
         }
-        if !metadata.known && STATIC_FREE_MODELS.contains(&model) {
+        if !metadata.known && self.last_good_zen.contains(model) {
             return Decision::allow("static_verified", false);
         }
         metadata
@@ -514,16 +509,18 @@ impl ModelCatalog {
     /// 也不暴露没核实过的。
     pub fn list(&self) -> Vec<String> {
         if self.zen.is_empty() {
-            let mut out: Vec<String> = STATIC_FREE_MODELS.iter().map(|s| s.to_string()).collect();
+            // 实时清单没有：用最近一次成功解析出来的结果。
+            let mut out: Vec<String> = self.last_good_zen.iter().cloned().collect();
             out.sort();
             return out;
         }
         if !self.prices_ready {
-            // 元数据没就绪：只暴露实测过的那几个，且必须还在实时清单里。
+            // 元数据没就绪：只暴露"上次成功解析过、且此刻仍在实时清单里"的模型。
+            // 编译期写死的名单已经去掉——它会随上游增减而陈旧，正是要消除的那类误导。
             let mut out: Vec<String> = self
                 .zen
                 .iter()
-                .filter(|m| STATIC_FREE_MODELS.contains(&m.as_str()))
+                .filter(|m| self.last_good_zen.contains(*m))
                 .cloned()
                 .collect();
             out.sort();
@@ -653,30 +650,49 @@ mod tests {
     }
 
     #[test]
-    fn 目录判定废弃时静态兜底不许复活它() {
-        let mut catalog = ModelCatalog::new(None);
+    fn 目录判定废弃时无论有无兜底都不复活() {
         let mut prices = BTreeMap::new();
         prices.insert("mimo-v2.5-free".to_string(), price(Some(0.0), true));
         prices.insert("muse-spark-1.2-contributor-free".to_string(), price(Some(0.0), true));
-        catalog.prices = prices;
+        prices.insert("big-pickle".to_string(), price(Some(0.0), false));
+
+        // 有兜底快照时：废弃判定依然压过它（快照只用于"元数据缺失"路径）
+        let mut catalog = ModelCatalog::new(None);
+        catalog.prices = prices.clone();
         catalog.prices_ready = true;
         catalog.zen = ["mimo-v2.5-free", "muse-spark-1.2-contributor-free", "big-pickle"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+            .iter().map(|s| s.to_string()).collect();
+        catalog.last_good_zen = catalog.zen.clone();
         let list = catalog.list();
         assert!(!list.contains(&"mimo-v2.5-free".to_string()), "下架的不该复活");
-        assert!(
-            !list.contains(&"muse-spark-1.2-contributor-free".to_string()),
-            "下架的不该复活"
-        );
+        assert!(!list.contains(&"muse-spark-1.2-contributor-free".to_string()), "下架的不该复活");
         assert!(list.contains(&"big-pickle".to_string()), "在架的应保留");
+
+        // 无兜底快照时：只按废弃判定走
+        let mut bare = ModelCatalog::new(None);
+        bare.prices = prices;
+        bare.prices_ready = true;
+        bare.zen = catalog.zen.clone();
+        let list2 = bare.list();
+        assert_eq!(list2, vec!["big-pickle".to_string()]);
     }
 
     #[test]
-    fn 没有实时清单时退回静态清单() {
+    fn 没有任何数据源时返回空清单() {
+        // 编译期写死名单已移除：没有实时清单、没有缓存、没有上次结果 → 空。
+        // 宁可空着（用户看得见"没数据"），也不给一份会过期的假名单。
         let catalog = ModelCatalog::new(None);
-        assert_eq!(catalog.list().len(), STATIC_FREE_MODELS.len());
+        assert!(catalog.list().is_empty(), "无数据源时不该凭空造出清单");
+    }
+
+    #[test]
+    fn 元数据缺失时只保留上次成功解析过的() {
+        let mut catalog = ModelCatalog::new(None);
+        catalog.zen = ["kept-free", "brand-new-free", "paid-x"]
+            .iter().map(|s| s.to_string()).collect();
+        catalog.last_good_zen = ["kept-free"].iter().map(|s| s.to_string()).collect();
+        // prices_ready = false
+        assert_eq!(catalog.list(), vec!["kept-free".to_string()]);
     }
 
     #[test]
@@ -725,21 +741,18 @@ mod outage_tests {
     use super::*;
 
     #[test]
-    fn 元数据缺失时只暴露实测清单_不放_DEPRECATED() {
+    fn 元数据缺失时只保留上次成功过的_不放未核实的新模型() {
         let mut catalog = ModelCatalog::new(None);
-        // 模拟事故现场：实时清单在（zen 有值），元数据一个都没有
+        // 事故现场：实时清单在（zen 有值），元数据一个都没有，也没有兜底快照
         catalog.zen = [
             "big-pickle",
-            "mimo-v2.5-free",       // 目录里已下架，但名字带 free
-            "deepseek-v4-flash-free", // 同上
-            "made-up-future-free",  // 上游新加的、谁也没核实过的
+            "mimo-v2.5-free",          // 目录里已下架，但名字带 free
+            "made-up-future-free",     // 上游新加的、谁也没核实过
         ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        // prices_ready = false（默认）
-        let list = catalog.list();
-        assert_eq!(list, vec!["big-pickle".to_string()], "只该暴露实测过的: {:?}", list);
+        .iter().map(|s| s.to_string()).collect();
+        // 无兜底快照 → 只保留有元数据判定依据的（这里没有）→ 空
+        // 静默开着，不写一份假配置。
+        assert!(catalog.list().is_empty(), "无元数据无快照时不该造清单: {:?}", catalog.list());
     }
 
     #[test]

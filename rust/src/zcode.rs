@@ -18,34 +18,6 @@ pub fn our_ids() -> [&'static str; 2] {
     [PROVIDER_ID, RESPONSES_PROVIDER_ID]
 }
 
-/// 首启/断网兜底：2026-10-01 对 models.dev 逐项实测过的值。
-/// 元数据拿不到时，已知模型用这里的中肯值，而不是 262144/32768 的裸默认——
-/// 裸默认没有思考档位，模型选择器里就没有档位可调（2026-10-02 事故）。
-pub struct BootstrapEntry {
-    pub id: &'static str,
-    pub context_window: f64,
-    pub max_tokens: f64,
-    pub supports_images: bool,
-    pub thinking_levels: &'static [&'static str],
-}
-
-const CHAT_LEVELS: &[&str] = &["minimal", "low", "medium", "high"];
-const SPACE_BUNNY_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-const MUSE_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
-
-pub const BOOTSTRAP: [BootstrapEntry; 9] = [
-    BootstrapEntry { id: "big-pickle", context_window: 200000.0, max_tokens: 32000.0, supports_images: false, thinking_levels: CHAT_LEVELS },
-    BootstrapEntry { id: "ling-3.0-flash-fin-free", context_window: 262144.0, max_tokens: 32768.0, supports_images: false, thinking_levels: CHAT_LEVELS },
-    BootstrapEntry { id: "longcat-2.5-preview-free", context_window: 1000000.0, max_tokens: 131072.0, supports_images: true, thinking_levels: CHAT_LEVELS },
-    BootstrapEntry { id: "mimo-v2.6-flash-free", context_window: 200000.0, max_tokens: 32000.0, supports_images: true, thinking_levels: CHAT_LEVELS },
-    BootstrapEntry { id: "nemotron-3-ultra-free", context_window: 1000000.0, max_tokens: 128000.0, supports_images: false, thinking_levels: CHAT_LEVELS },
-    BootstrapEntry { id: "nemotron-3.5-lightning-free", context_window: 262144.0, max_tokens: 262144.0, supports_images: false, thinking_levels: CHAT_LEVELS },
-    BootstrapEntry { id: "space-bunny-free", context_window: 1048576.0, max_tokens: 524288.0, supports_images: true, thinking_levels: SPACE_BUNNY_LEVELS },
-    BootstrapEntry { id: "fledge-alpha-free", context_window: 1048576.0, max_tokens: 131072.0, supports_images: true, thinking_levels: &["low", "high", "max"] },
-    // responses 道的 muse 也一样要兜底（Node 版有、这里先前漏了）
-    BootstrapEntry { id: "muse-spark-1.3-contributor-free", context_window: 1048576.0, max_tokens: 131072.0, supports_images: true, thinking_levels: &["minimal", "low", "medium", "high", "xhigh"] },
-];
-
 /// muse-spark-* 只答 /v1/responses，jev-* 只答 /systemone，都不能进 chat 那条道。
 pub fn is_chat_lane_model(id: &str) -> bool {
     let lower = id.to_lowercase();
@@ -62,18 +34,14 @@ pub struct ModelEntry {
 }
 
 /// models.dev 元数据 → 声明条目；缺元数据时给中性默认值，绝不退化成裸 ID。
+/// models.dev 元数据 → 声明条目。
+///
+/// 元数据拿不到时给中性默认（262144/32768、无图、无思考档位）。这里**不**放编译期
+/// 写死的实测表——那份表会随上游增减而陈旧，写进代码里等于让程序永远按某个历史
+/// 快照说话。真拿不到元数据时，模型选择器里没有档位可选是**如实反映"数据未知"**，
+/// 比给一份可能过期的假档位更诚实（且静默开着，配置不会来回抖动）。
 pub fn catalog_entry(id: &str, catalog: &ModelCatalog) -> ModelEntry {
     let Some(meta) = catalog.metadata(id) else {
-        // 元数据缺失：已知模型用实测兜底值，未知的才给中性默认。
-        if let Some(b) = BOOTSTRAP.iter().find(|b| b.id == id) {
-            return ModelEntry {
-                id: id.to_string(),
-                context_window: b.context_window,
-                max_tokens: b.max_tokens,
-                supports_images: b.supports_images,
-                thinking_levels: b.thinking_levels.iter().map(|s| s.to_string()).collect(),
-            };
-        }
         return ModelEntry {
             id: id.to_string(),
             context_window: 262144.0,
@@ -363,7 +331,7 @@ pub fn backup_stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{Price, STATIC_FREE_MODELS};
+    use crate::catalog::Price;
     use std::collections::BTreeMap;
 
     fn sample_entries() -> (Vec<ModelEntry>, Vec<ModelEntry>) {
@@ -448,11 +416,6 @@ mod tests {
         let merged = build_zcode_config(Some(&existing), 41930, &chat, &responses);
         let text = serde_json::to_string(&redact_secrets(&merged)).unwrap();
         assert!(!text.contains("sk-真实密钥"), "不该把用户密钥打到终端上");
-    }
-
-    #[test]
-    fn 静态清单里的模型数与文档一致() {
-        assert_eq!(STATIC_FREE_MODELS.len(), 8, "应是桌面版那 8 个免费模型");
     }
 
     #[test]

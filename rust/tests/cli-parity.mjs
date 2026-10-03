@@ -69,6 +69,17 @@ const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'o2z-compare-'));
 const nodeConfig = path.join(workDir, 'node.json');
 const rustConfig = path.join(workDir, 'rust.json');
 
+// 共享缓存种子：对拍比较的是「同一份输入下两个实现的输出」，不该受网络波动
+// 影响。把本机最近一次成功的目录缓存拷进两边的配置目录，两个实现从完全相同
+// 的数据出发——models.dev/Zen 时通时断也不再让对拍假失败。
+const REAL_CACHE = path.join(process.env.ZCODE_DATA_BASE_DIR || '', '.zcode', 'v2', 'opencode2zcode-catalog.json');
+if (fs.existsSync(REAL_CACHE)) {
+  fs.copyFileSync(REAL_CACHE, path.join(workDir, 'opencode2zcode-catalog.json'));
+  console.log(`（已注入共享缓存种子：${path.basename(REAL_CACHE)}）`);
+} else {
+  console.log('（本机没有目录缓存，对拍走实时网络——网络抖动可能造成假失败）');
+}
+
 console.log('Node 版 vs Rust 版 对拍\n');
 
 if (!fs.existsSync(RUST_EXE)) {

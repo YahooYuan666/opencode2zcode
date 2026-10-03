@@ -223,7 +223,7 @@ curl http://127.0.0.1:41930/healthz
 ```
 
 然后 `curl` 应回 `"ok":true` 且 `catalog.source` 为 `live`
-（`static` 表示还没联网成功，用内置兜底清单，仍可用）。
+（网络不通时用磁盘缓存里最近一次成功的结果顶上，仍可用；缓存也没有就先空着）。
 
 再发一条真实对话确认整条链路：
 
@@ -300,7 +300,7 @@ OpenCode Zen 的匿名免费档位接受一个公开占位符 `public` 作为凭
 | 报 403 `FreeTierError` | 伪装头或请求体门禁没过，上游收紧了。改 `rust/src/zen.rs` 里的 `OPENCODE_CLIENT_VERSION` 跟官方 CLI 版本号 |
 | 报 429 | 匿名通道按 IP 限速，等一会儿 |
 | 报 400 `invalid request` | 看代理 stderr 有没有「摘掉该字段重试」的日志；重试也失败说明这个模型当前不可用 |
-| 模型列表比预期少 | 看 `/healthz` 的 `catalog.status`，`static` = 还没联网成功，用的是内置兜底清单。目录里判定为「已下架」的模型会被有意剔掉，属正常 |
+| 模型列表比预期少 | 看 `/healthz` 的 `catalog.status` 与 `lastError`。网络中断时用缓存里最近一次成功的结果顶上；目录判定为「已下架」的会被有意剔掉，属正常 |
 | ZCode 启动时什么都没发生，模型不生效 | 钩子指向的路径可能失效了（文件被移动/改名过）。在新位置重跑一次 `--install`，它会替换掉旧的那条 |
 | 改了代码怕改坏 | 跑 `node selftest.mjs`，22 项全过再交付 |
 

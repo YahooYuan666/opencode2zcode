@@ -364,6 +364,7 @@ OpenCode 桌面版逐位一致，桌面版列多少这里就写多少。`/health
 | 对话报 403 `FreeTierError` | 伪装头或体门禁没过，上游收紧了。`x-opencode-client` / `user-agent` 的版本号可能要跟着官方 CLI 更新 |
 | 对话报 429 | 匿名通道按 IP 限速，等一会儿 |
 | 模型数和文档里写的不一样 | 正常——清单随上游自动增减，以 `curl http://127.0.0.1:41930/v1/models` 实时结果为准 |
+| WebSearch 报 "does not support native WebSearch" | ZCode 的「原生联网搜索」只在 Anthropic API 管道上有实现（映射到 Anthropic 服务端的 web_search 工具），OpenAI 兼容管道——包括本工具——没有编码，声明了能力位也会在请求时被拒。这是 ZCode 的功能边界，本工具无法绕过。**读具体网址用 WebFetch**（走的是另一条路，本工具已适配） |
 | 对话报 400 `invalid request` | 看代理 stderr 有没有「摘掉该字段重试」的日志；若重试也 400，多半是这个模型当前不可用 |
 | 想撤销 | 双击 `uninstall.cmd`（钩子和 Provider 一起清干净）。只想清 Provider 就 `node zen-proxy.mjs --remove-provider`；只想停自启就 `node zen-proxy.mjs --uninstall` |
 

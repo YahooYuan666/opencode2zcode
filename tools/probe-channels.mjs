@@ -195,10 +195,42 @@ async function discoverFromUpstream(models, options) {
     freeIds = null;
   }
 
+  // 若 models.dev 直连拉取失败，尝试读取本地已有的 catalog 缓存保底
+  if (!freeIds) {
+    const cacheCandidates = [
+      process.env.ZCODE_DATA_BASE_DIR
+        ? path.join(process.env.ZCODE_DATA_BASE_DIR, '.zcode', 'v2', 'opencode2zcode-catalog.json')
+        : null,
+      'D:/Program/.zcode/v2/opencode2zcode-catalog.json',
+      path.join(process.env.USERPROFILE || '', '.zcode', 'v2', 'opencode2zcode-catalog.json'),
+    ].filter(Boolean);
+
+    for (const cPath of cacheCandidates) {
+      if (fs.existsSync(cPath)) {
+        try {
+          const cacheData = JSON.parse(fs.readFileSync(cPath, 'utf8'));
+          if (Array.isArray(cacheData.prices) && cacheData.prices.length > 0) {
+            freeIds = new Set(
+              cacheData.prices
+                .filter(([, m]) => (!m.input || m.input === 0) && !m.deprecated)
+                .map(([id]) => id),
+            );
+            break;
+          }
+        } catch {}
+      }
+    }
+  }
+
   for (const id of zenIds) {
     if (models.some((m) => m.id === id)) continue;
-    // 名字里带 free 的一律纳入（目录数据缺失时，宁可多测也不要漏）
-    if (freeIds && !freeIds.has(id) && !id.toLowerCase().includes('free')) continue;
+    // 只有在免费名单内、或名字显式带 free 的才纳入探测队列；
+    // 绝不将 80+ 个付费商业模型错误加入探测队列
+    if (freeIds) {
+      if (!freeIds.has(id) && !id.toLowerCase().includes('free')) continue;
+    } else {
+      if (!id.toLowerCase().includes('free')) continue;
+    }
     models.push({ id, lane: 'unknown' });
   }
 }

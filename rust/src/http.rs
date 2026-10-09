@@ -8,13 +8,59 @@ use std::time::Duration;
 use reqwest::blocking::Client;
 use serde_json::Value;
 
+fn detect_proxy() -> Option<reqwest::Proxy> {
+    // 如果系统环境已配置 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY，reqwest 默认会自行读取。
+    // 在 Windows 环境下，若环境变量未设置，自动读取注册表 Internet Settings（如 Clash/v2ray/系统代理开启时）。
+    #[cfg(windows)]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") {
+            let enabled: u32 = hkcu.get_value("ProxyEnable").unwrap_or(0);
+            if enabled == 1 {
+                if let Ok(server) = hkcu.get_value::<String, _>("ProxyServer") {
+                    // server 格式可能为: "http=127.0.0.1:7890;https=127.0.0.1:7890;socks=127.0.0.1:7890" 或 "127.0.0.1:7890"
+                    let https_target = server
+                        .split(';')
+                        .find_map(|part| {
+                            let part = part.trim();
+                            if let Some(rest) = part.strip_prefix("https=") {
+                                Some(rest)
+                            } else if !part.contains('=') {
+                                Some(part)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(server.as_str());
+
+                    let proxy_url = if https_target.starts_with("http://") || https_target.starts_with("https://") {
+                        https_target.to_string()
+                    } else {
+                        format!("http://{https_target}")
+                    };
+
+                    if let Ok(p) = reqwest::Proxy::all(&proxy_url) {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn client() -> Result<Client, String> {
-    Client::builder()
+    let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .pool_idle_timeout(Duration::from_secs(90))
-        .user_agent("opencode2zcode")
-        .build()
-        .map_err(|e| e.to_string())
+        .user_agent("opencode2zcode");
+
+    if let Some(proxy) = detect_proxy() {
+        builder = builder.proxy(proxy);
+    }
+
+    builder.build().map_err(|e| e.to_string())
 }
 
 /// GET 一个 JSON，带超时；失败返回 Err，调用方决定怎么记 lastError。

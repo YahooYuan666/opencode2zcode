@@ -787,7 +787,7 @@ mod outage_tests {
         // 模拟坏缓存被修好（比如另一个健康实例写回了好数据）
         std::fs::write(
             &path,
-            r#"{"version":1,"updatedAt":1790863206330,"zen":["big-pickle"],"prices":[["big-pickle",{"input":0,"output":0,"deprecated":false,"reasoning":true,"contextWindow":1,"maxTokens":1,"modalitiesInput":[],"effortValues":[]}]]}"#,
+            &format!(r#"{{"version":1,"updatedAt":{},"zen":["big-pickle"],"prices":[["big-pickle",{{"input":0,"output":0,"deprecated":false,"reasoning":true,"contextWindow":1,"maxTokens":1,"modalitiesInput":[],"effortValues":[]}}]]}}"#, now_ms()),
         )
         .unwrap();
         catalog.seed_from_cache();

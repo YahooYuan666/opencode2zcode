@@ -128,12 +128,11 @@ opencode2zcode.exe --write-config-only
 ```
 [zen] 配置目标（自动探测）：<数据根>\.zcode\v2\provider_config.json
 已写入 <数据根>\.zcode\v2\provider_config.json
-chat N 个模型 / responses 1 个模型（N 随上游增减，当前为 8）
+chat N 个模型 / responses M 个模型
 ```
 
-> 期望是 **responses 1 个**（muse-spark）、chat 道若干个——合计与 OpenCode 桌面版
-> 当前列出的免费模型完全一致。**数量随上游自动增减**（2026-10-02 实测 chat 8 +
-> responses 1 = 9），不要拿本文写的数字当硬性预期。
+> chat 与 responses 各有几个**随上游自动增减**，两条道分别装哪些模型由官方目录里
+> 每个模型自己声明的 SDK 决定，不按名字猜。不要拿某次实测的数字当硬性预期。
 > 数字对不上通常意味着目录刷新没成功（`catalog.source` 不是 `live`），
 > 或者上游在变——先跑 `--detect` 和 `/healthz` 确认，不要硬凑。
 
@@ -219,7 +218,7 @@ curl http://127.0.0.1:41930/healthz
 ```
 [zen] 回环代理已监听 127.0.0.1:41930
 [zen] 已同步 ZCode 配置：<数据根>\.zcode\v2\provider_config.json
-[zen] chat 8 个 / responses 1 个模型（数字随上游增减）
+[zen] chat N 个 / responses M 个模型（数字随上游增减）
 ```
 
 然后 `curl` 应回 `"ok":true` 且 `catalog.source` 为 `live`
@@ -280,8 +279,9 @@ OpenCode Zen 的匿名免费档位接受一个公开占位符 `public` 作为凭
 429 会被原样透传给用户。不要用它跑大批量任务。
 
 **③ 两条线格式的规则不一样，别照搬。**
-`muse-spark-1.3-contributor-free` 走 `/v1/responses`，其余 7 个走
-`/v1/chat/completions`。**两条都要过同一道门禁**（请求体里必须有 `bash` 和 `read`
+一个模型走哪条线看官方目录里它自己声明的 SDK：`@ai-sdk/openai` 的走
+`/v1/responses`，`openai-compatible` 的走 `/v1/chat/completions`。
+**两条都要过同一道门禁**（请求体里必须有 `bash` 和 `read`
 两个工具），否则 403。代理已经处理好了，但如果对方要自己改代码，注意两点：
 
 - responses 的工具定义是**扁平**的 `{type, name, description, parameters}`；
@@ -381,5 +381,5 @@ const isFree = (provider, cost) => provider === "opencode" && (!cost || cost.inp
 本工具照搬，**外加排除 `status == "deprecated"`**。两点容易踩：
 只看 `input` 不看 `output`，且「没有 cost 数据」也算免费；
 Zen 会把下架模型留在公开清单里而标价仍是 0，不排除的话模型选择器里会出现
-点下去必报错的选项。目录里标称免费的有 34 个，过滤后剩 8 个，与桌面版完全相同。
+点下去必报错的选项。过滤后剩下的与桌面版完全相同，数量随上游增减。
 `rust/src/catalog.rs` 的单元测试里有针对这一条的回归。

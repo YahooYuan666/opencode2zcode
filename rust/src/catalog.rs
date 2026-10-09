@@ -25,6 +25,39 @@ pub struct Price {
     pub max_tokens: f64,
     pub modalities_input: Vec<String>,
     pub effort_values: Vec<String>,
+    /// 上游自己声明的线格式：官方目录里该模型的 `provider.npm`。
+    /// `None` 表示没有逐模型声明，走段级默认（chat）。
+    pub wire: Option<Wire>,
+}
+
+/// 一个模型走哪条线。来源是官方目录的 SDK 声明，不是模型名。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wire {
+    /// `@ai-sdk/openai-compatible`：/v1/chat/completions
+    Chat,
+    /// `@ai-sdk/openai`：/v1/responses
+    Responses,
+    /// `@ai-sdk/anthropic` 等：本工具没有对应的道，不能代理。
+    Unsupported,
+}
+
+impl Wire {
+    fn as_str(self) -> &'static str {
+        match self {
+            Wire::Chat => "chat",
+            Wire::Responses => "responses",
+            Wire::Unsupported => "unsupported",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "chat" => Some(Wire::Chat),
+            "responses" => Some(Wire::Responses),
+            "unsupported" => Some(Wire::Unsupported),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +78,25 @@ impl Decision {
 
 fn is_free_model(model: &str) -> bool {
     model.to_lowercase().contains("free")
+}
+
+/// 官方目录里的 SDK 包名 → 线格式。
+///
+/// `@ai-sdk/openai` 是 Responses 线，`@ai-sdk/openai-compatible` 是 chat 线，
+/// 两者必须先判精确的那个——`openai-compatible` 也含 `openai` 子串。
+/// anthropic / google / mistral 这些本工具没有对应的道，标成不可代理。
+pub fn decode_wire(npm: Option<&str>) -> Option<Wire> {
+    let value = npm?.trim().to_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    if value == "@ai-sdk/openai" || value.ends_with("/openai") {
+        return Some(Wire::Responses);
+    }
+    if value.contains("openai-compatible") {
+        return Some(Wire::Chat);
+    }
+    Some(Wire::Unsupported)
 }
 
 /// models.dev 的 opencode 段 → modelId → 元数据。
@@ -125,6 +177,12 @@ pub fn decode_models_dev(data: &Value) -> BTreeMap<String, Price> {
                     max_tokens: num(limit.and_then(|l| l.get("output"))).unwrap_or(32768.0),
                     modalities_input,
                     effort_values: decode_effort_values(raw.get("reasoning_options")),
+                    // 逐模型的 npm 覆盖段级默认；没有逐模型声明就走段级（chat）。
+                    wire: decode_wire(
+                        raw.pointer("/provider/npm")
+                            .and_then(Value::as_str)
+                            .or_else(|| provider.get("npm").and_then(Value::as_str)),
+                    ),
                 },
             );
         }
@@ -219,8 +277,10 @@ pub fn decide(model: &str, prices: &BTreeMap<String, Price>, ready: bool) -> Dec
     if !ready || prices.is_empty() {
         return fallback("metadata_pending");
     }
+    // 目录里查无此模型：不按名字放行。实时清单里混着大量名字带 free 的
+    // 付费或未核实模型，名字兜底只在「整份元数据都没拉到」时才有意义。
     let Some(price) = prices.get(model) else {
-        return fallback("metadata_model_missing");
+        return Decision::deny("metadata_model_missing", false);
     };
     // 废弃是硬否决，后面的兜底也不许把它捞回来。
     if price.deprecated {
@@ -260,6 +320,9 @@ pub struct ModelCatalog {
     seeded: bool,
     cached_fingerprint: String,
     last_change_key: String,
+    /// 上次拉到的 models.dev ETag。带上 If-None-Match 后，目录没变就回 304，
+    /// 不用每 5 分钟重下那 5MB。
+    metadata_etag: Option<String>,
 }
 
 fn now_ms() -> u128 {
@@ -284,6 +347,7 @@ impl ModelCatalog {
             seeded: false,
             cached_fingerprint: String::new(),
             last_change_key: String::new(),
+            metadata_etag: None,
         }
     }
 
@@ -332,6 +396,10 @@ impl ModelCatalog {
                 self.prices = map;
                 self.last_good_prices = self.prices.clone();
                 self.prices_ready = true;
+                // 缓存里清单和元数据是同一次写出来的，两者都在才构成可信快照。
+                if !self.zen.is_empty() {
+                    self.last_good_zen = self.zen.clone();
+                }
             }
         }
         self.cached_fingerprint = self.fingerprint();
@@ -386,7 +454,13 @@ impl ModelCatalog {
         self.refresh_metadata();
         self.save_cache();
 
-        let key = self.list().join("|");
+        let exposed = self.list();
+        // 快照记「这次真的被放行的」，不是整份实时清单。实时清单里混着
+        // 付费和未核实的模型，整份记下来会在元数据抖动时被原样放行。
+        if !exposed.is_empty() {
+            self.last_good_zen = exposed.iter().cloned().collect();
+        }
+        let key = exposed.join("|");
         let changed = key != self.last_change_key;
         self.last_change_key = key;
         changed
@@ -424,11 +498,14 @@ impl ModelCatalog {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        self.zen = ids;
-                        let now = now_ms();
-                        self.updated_at_ms = now;
-                        self.live_at_ms = now;
-                        self.last_error.clear();
+                        // 空清单不覆盖：上游抖动回了空 body 时，保住上一次的结果。
+                        if !ids.is_empty() {
+                            self.zen = ids;
+                            let now = now_ms();
+                            self.updated_at_ms = now;
+                            self.live_at_ms = now;
+                            self.last_error.clear();
+                        }
                     }
                     Err(e) => self.last_error = e.to_string(),
                 }
@@ -450,20 +527,35 @@ impl ModelCatalog {
                 return;
             }
         };
-        let result: Result<Value, String> = (|| {
-            let response = client
+        // 闭包只负责取数据，不碰 self：304 返回 None，200 返回 (etag, 正文)。
+        let result: Result<Option<(Option<String>, Value)>, String> = (|| {
+            let mut request = client
                 .get(crate::METADATA_URL)
                 .header("accept", "application/json")
-                .timeout(CATALOG_TIMEOUT)
-                .send()
-                .map_err(|e| e.to_string())?;
+                .timeout(CATALOG_TIMEOUT);
+            if let Some(etag) = &self.metadata_etag {
+                request = request.header("if-none-match", etag);
+            }
+            let response = request.send().map_err(|e| e.to_string())?;
+            // 304：目录没变，沿用内存里的那份，不再解析。
+            if response.status().as_u16() == 304 {
+                return Ok(None);
+            }
             if !response.status().is_success() {
                 return Err(format!("models.dev returned HTTP {}", response.status()));
             }
-            response.json::<Value>().map_err(|e| e.to_string())
+            let etag = response
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let data = response.json::<Value>().map_err(|e| e.to_string())?;
+            Ok(Some((etag, data)))
         })();
         match result {
-            Ok(data) => {
+            Ok(None) => {}
+            Ok(Some((etag, data))) => {
+                self.metadata_etag = etag;
                 let prices = decode_models_dev(&data);
                 if prices.is_empty() {
                     if !self.prices_ready {
@@ -589,6 +681,7 @@ fn price_to_value(p: &Price) -> Value {
         "maxTokens": p.max_tokens,
         "modalitiesInput": p.modalities_input,
         "effortValues": p.effort_values,
+        "wire": p.wire.map(Wire::as_str),
     })
 }
 
@@ -610,6 +703,7 @@ fn price_from_value(v: &serde_json::Map<String, Value>) -> Option<Price> {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
             .unwrap_or_default(),
+        wire: v.get("wire").and_then(Value::as_str).and_then(Wire::from_str),
     })
 }
 
@@ -693,6 +787,41 @@ mod tests {
         catalog.last_good_zen = ["kept-free"].iter().map(|s| s.to_string()).collect();
         // prices_ready = false
         assert_eq!(catalog.list(), vec!["kept-free".to_string()]);
+    }
+
+    #[test]
+    fn 线路按官方声明的_sdk_归类不看名字() {
+        // openai-compatible 也含 openai 子串，必须先判精确的那个。
+        assert_eq!(decode_wire(Some("@ai-sdk/openai")), Some(Wire::Responses));
+        assert_eq!(decode_wire(Some("@ai-sdk/openai-compatible")), Some(Wire::Chat));
+        assert_eq!(decode_wire(Some("@ai-sdk/anthropic")), Some(Wire::Unsupported));
+        assert_eq!(decode_wire(None), None);
+        assert_eq!(decode_wire(Some("  ")), None);
+
+        // 名字像 chat 模型，但官方声明它走 responses：声明说了算。
+        let mut prices = BTreeMap::new();
+        prices.insert(
+            "looks-like-chat-free".to_string(),
+            Price { input: Some(0.0), wire: Some(Wire::Responses), ..Default::default() },
+        );
+        // 官方声明本工具代理不了的，不进任何一条道。
+        prices.insert(
+            "anthropic-shaped-free".to_string(),
+            Price { input: Some(0.0), wire: Some(Wire::Unsupported), ..Default::default() },
+        );
+        let catalog = ModelCatalog::with_prices(
+            prices,
+            ["looks-like-chat-free", "anthropic-shaped-free"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        assert_eq!(crate::zcode::lane_for("looks-like-chat-free", &catalog), Some(Wire::Responses));
+        assert_eq!(crate::zcode::lane_for("anthropic-shaped-free", &catalog), None);
+        // 目录没说话时才退回按名字猜。
+        assert_eq!(crate::zcode::lane_for("muse-spark-x", &catalog), Some(Wire::Responses));
+        assert_eq!(crate::zcode::lane_for("plain-free", &catalog), Some(Wire::Chat));
+        assert_eq!(crate::zcode::lane_for("jev-something", &catalog), None);
     }
 
     #[test]

@@ -147,7 +147,8 @@ async function discoverModels(port, targetModel, options = {}) {
   if (targetModel) {
     const matched = models.filter((m) => m.id.toLowerCase().includes(targetModel.toLowerCase()));
     if (matched.length > 0) return matched;
-    return [{ id: targetModel, lane: targetModel.includes('muse-spark') ? 'responses' : 'chat' }];
+    // 目录里查不到时不按名字猜线路，三道都试，让实测结果说话。
+    return [{ id: targetModel, lane: 'unknown' }];
   }
 
   return models;
@@ -180,19 +181,29 @@ async function discoverFromUpstream(models, options) {
     return; // 上游不可达就只用代理已暴露的，不臆造
   }
 
-  // models.dev 判定免费（与插件/desktop 的 isFree 规则一致）
+  // 官方目录判定免费，并记下每个模型自己声明的线路（provider.npm）。
+  // 官方目录拉不到时退回 models.dev 镜像，两者形状相同。
   let freeIds = null;
-  try {
-    const res = await fetch('https://models.dev/api.json', { signal: AbortSignal.timeout(timeoutMs) });
-    const data = await res.json();
-    const modelsMap = (data.providers || data).opencode?.models || {};
-    freeIds = new Set(
-      Object.entries(modelsMap)
-        .filter(([, m]) => (!m.cost || m.cost.input === 0) && (m.status ?? 'none') !== 'deprecated')
-        .map(([id]) => id),
-    );
-  } catch {
-    freeIds = null;
+  const declaredLane = new Map();
+  for (const url of ['https://models.opencode.ai/api.json', 'https://models.dev/api.json']) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const section = (data.providers || data).opencode || {};
+      const modelsMap = section.models || {};
+      freeIds = new Set(
+        Object.entries(modelsMap)
+          .filter(([, m]) => (!m.cost || m.cost.input === 0) && (m.status ?? 'none') !== 'deprecated')
+          .map(([id]) => id),
+      );
+      for (const [id, m] of Object.entries(modelsMap)) {
+        declaredLane.set(id, laneFromNpm(m.provider?.npm ?? section.npm));
+      }
+      break;
+    } catch {
+      /* 换下一个源 */
+    }
   }
 
   // 若 models.dev 直连拉取失败，尝试读取本地已有的 catalog 缓存保底
@@ -231,8 +242,16 @@ async function discoverFromUpstream(models, options) {
     } else {
       if (!id.toLowerCase().includes('free')) continue;
     }
-    models.push({ id, lane: 'unknown' });
+    models.push({ id, lane: declaredLane.get(id) || 'unknown' });
   }
+}
+
+/** 官方目录的 SDK 包名 → 线路。没声明或本工具代理不了的，交给实测去试。 */
+function laneFromNpm(npm) {
+  const value = String(npm ?? '').trim().toLowerCase();
+  if (value === '@ai-sdk/openai' || value.endsWith('/openai')) return 'responses';
+  if (value.includes('openai-compatible')) return 'chat';
+  return null;
 }
 
 // 分类体系判定函数

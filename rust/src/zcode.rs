@@ -6,7 +6,7 @@
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
-use crate::catalog::{efforts_for, ModelCatalog};
+use crate::catalog::{efforts_for, ModelCatalog, Wire};
 use crate::zen::ANONYMOUS_KEY;
 
 pub const PROVIDER_ID: &str = "opencode-free";
@@ -18,10 +18,27 @@ pub fn our_ids() -> [&'static str; 2] {
     [PROVIDER_ID, RESPONSES_PROVIDER_ID]
 }
 
-/// muse-spark-* 只答 /v1/responses，jev-* 只答 /systemone，都不能进 chat 那条道。
-pub fn is_chat_lane_model(id: &str) -> bool {
+/// 这个模型走哪条线。
+///
+/// 优先信官方目录里该模型自己声明的 SDK（`provider.npm`）：`@ai-sdk/openai`
+/// 走 responses，`openai-compatible` 走 chat，anthropic 等本工具代理不了。
+/// 目录没说话时才退回按名字猜——muse-spark 走 responses，jev 走本工具没有的
+/// systemone 道，其余当 chat。
+pub fn lane_for(id: &str, catalog: &ModelCatalog) -> Option<Wire> {
+    if let Some(wire) = catalog.metadata(id).and_then(|p| p.wire) {
+        return match wire {
+            Wire::Unsupported => None,
+            other => Some(other),
+        };
+    }
     let lower = id.to_lowercase();
-    !lower.is_empty() && !lower.starts_with("muse-spark") && !lower.starts_with("jev")
+    if lower.is_empty() || lower.starts_with("jev") {
+        return None;
+    }
+    if lower.starts_with("muse-spark") {
+        return Some(Wire::Responses);
+    }
+    Some(Wire::Chat)
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +80,7 @@ pub fn chat_model_entries(catalog: &ModelCatalog) -> Vec<ModelEntry> {
     catalog
         .list()
         .into_iter()
-        .filter(|id| is_chat_lane_model(id))
+        .filter(|id| lane_for(id, catalog) == Some(Wire::Chat))
         .map(|id| catalog_entry(&id, catalog))
         .collect()
 }
@@ -72,7 +89,7 @@ pub fn responses_model_entries(catalog: &ModelCatalog) -> Vec<ModelEntry> {
     catalog
         .list()
         .into_iter()
-        .filter(|id| id.to_lowercase().starts_with("muse-spark"))
+        .filter(|id| lane_for(id, catalog) == Some(Wire::Responses))
         .map(|id| catalog_entry(&id, catalog))
         .collect()
 }

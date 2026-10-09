@@ -36,6 +36,10 @@ fn zen_base_url() -> String {
 }
 
 const METADATA_URL: &str = "https://models.dev/api.json";
+/// OpenCode 官方机器可读目录。和 models.dev 是同一份数据的两个镜像，
+/// 但只有它带每个模型的 `provider.npm`——那是上游自己声明的线格式，
+/// 线路判定以它为准，不再按模型名前缀猜。
+pub const CAPABILITIES_URL: &str = "https://models.opencode.ai/api.json";
 const DEFAULT_PORT: u16 = 41930;
 const PORT_CANDIDATES: [u16; 4] = [DEFAULT_PORT, 41931, 41932, 41933];
 const CACHE_FILE_NAME: &str = "opencode2zcode-catalog.json";
@@ -65,7 +69,8 @@ const HELP: &str = "opencode2zcode — 把 OpenCode Zen 匿名免费模型接进
 
 装完就不用再管了：启动 ZCode 时会自动静默拉起代理，不会有任何窗口。
 
-两条线格式都接：chat 道 7 个模型 + responses 道 1 个（muse-spark）。
+两条线格式都接：chat 道与 responses 道各有哪些模型随上游自动增减，
+线路按官方目录里每个模型自己声明的 SDK 归类，不再按名字前缀猜。
 两者共用同一道免费档门禁——请求体里必须带 bash 和 read 两个工具定义，
 详见 README「免费通道怎么过」。
 
@@ -320,6 +325,8 @@ fn main() {
     );
 
     // 目录刷新循环：每 5 分钟一次，只在暴露清单真的变了时重写配置。
+    // 必须复用同一个实例——它带着内存快照和 ETag。每次 new 一个空目录的话，
+    // models.dev 一次抖动就会让 list() 退成空清单，把 ZCode 里的模型刷没。
     let refresh_state = Arc::clone(&state);
     let refresh_path = config_path.clone();
     let refresh_base = base.clone();
@@ -327,9 +334,8 @@ fn main() {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(CATALOG_REFRESH);
-            let mut next = catalog::ModelCatalog::new(None);
-            if next.refresh_once(&refresh_base) {
-                apply_catalog(&next, &refresh_state, port, &refresh_path, refresh_with_responses);
+            if catalog.refresh_once(&refresh_base) {
+                apply_catalog(&catalog, &refresh_state, port, &refresh_path, refresh_with_responses);
             }
         }
     });

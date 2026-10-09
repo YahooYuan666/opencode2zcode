@@ -129,7 +129,7 @@ try {
     }
   }
   check('配置已写入且含模型', cfg !== null);
-  if (!cfg) throw new Error('配置始终没写出来，无法继续断言');
+  if (!cfg) throw new Error('配置始终没写出来，无法继续断言\n' + stderr.slice(0, 800));
   const chat = cfg.config.providerConfigRules.providerRules.find((r) => r.providerId === 'opencode-free');
   const responses = cfg.config.providerConfigRules.providerRules.find(
     (r) => r.providerId === 'opencode-free-responses',

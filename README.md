@@ -202,14 +202,9 @@ const isFree = (provider, cost) => provider === "opencode" && (!cost || cost.inp
 1. **只看 `input`，不看 `output`**；并且「没有 cost 数据」也算免费。
 2. **必须排除已下架**。Zen 把下架模型留在公开 `/models` 和目录里，标价仍是 0。
    不排除的话，模型选择器里会出现点下去必报错的选项。
-3. 因此「目录标称免费」34 个里**过滤后剩下的与桌面版完全相同**（数量随上游
-   增减自动跟随——2026-10-02 实测 9 个，此前是 8 个）：
-
-```
-big-pickle            ling-3.0-flash-fin-free   longcat-2.5-preview-free
-mimo-v2.6-flash-free  muse-spark-1.3-contributor-free
-nemotron-3-ultra-free nemotron-3.5-lightning-free  space-bunny-free
-```
+3. 因此「目录标称免费」里**过滤后剩下的与桌面版完全相同**，数量随上游增减
+   自动跟随，不在这里列死名单。某个时刻的样子可以用
+   `curl http://127.0.0.1:41930/v1/models` 看。
 
 > 早先版本要求 `input` 和 `output` **都**为 0、且不排除下架，于是多放进来了
 > `mimo-v2.5-free` 和 `muse-spark-1.2-contributor-free`（两个都已下架）。
@@ -217,8 +212,9 @@ nemotron-3-ultra-free nemotron-3.5-lightning-free  space-bunny-free
 
 ### 两条线格式，共用同一道门禁
 
-`muse-spark-1.3-contributor-free` 只挂在 OpenCode 的 `/v1/responses` 上，其余的
-走 `/v1/chat/completions`（哪些模型挂哪条道由上游决定，清单自动跟随）。**两条都要过同一道免费档门禁**——请求体里必须有
+一个模型走哪条线，看官方目录里它自己声明的 SDK：`@ai-sdk/openai` 的挂
+`/v1/responses`，`openai-compatible` 的走 `/v1/chat/completions`，不再按模型名
+前缀猜。**两条都要过同一道免费档门禁**——请求体里必须有
 `bash` 和 `read` 两个工具定义，缺了就是：
 
 ```

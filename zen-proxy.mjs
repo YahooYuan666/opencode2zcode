@@ -64,6 +64,9 @@ const ZEN_BASE_URL = (process.env.ZEN_BASE_URL?.trim() || 'https://opencode.ai/z
   '',
 );
 const METADATA_URL = 'https://models.dev/api.json';
+// OpenCode 官方机器可读目录，和 models.dev 是同一份数据的两个镜像。
+// 线路判定以它为准（每个模型自带 provider.npm），models.dev 只是镜像兜底。
+const CAPABILITIES_URL = 'https://models.opencode.ai/api.json';
 
 /** 匿名通道的固定 Bearer，不是密钥，PI-Desktop 那边也一样写死。 */
 const ANONYMOUS_KEY = 'public';
@@ -90,12 +93,9 @@ const RESPONSES_PROVIDER_NAME = 'OpenCode 免费模型 · Responses';
 const CACHE_FILE_NAME = 'opencode2zcode-catalog.json';
 
 /**
- * S3 兜底：实测可用的免费 id（取自 opencode2pi-desktop，2026-09）。
- * 离线首启、目录还没拉到时用这份，保证 provider 声明不是空的。
- */
-/**
- * 断网兜底清单：2026-10-01 对 models.dev 实时核对，等于桌面版当前那 8 个
- * 「免费且未下架」的模型。联网成功后由实时目录取代，这里只在 S1 拿不到时用。
+ * 断网兜底不再用编译期写死的名单：那份名单随上游增减而陈旧，写进代码等于
+ * 让程序永远按某个历史快照说话。拿不到实时数据时，用磁盘缓存里最近一次
+ * 成功解析的结果顶上；缓存也没有就先空着，不编造。
  */
 
 // ---------------------------------------------------------------------------
@@ -325,6 +325,19 @@ function metadataDeprecated(model) {
   return model.deprecated_at != null || model.retirement_date != null;
 }
 
+/**
+ * 官方目录里的 SDK 包名 → 线格式。
+ * `@ai-sdk/openai` 是 responses，`openai-compatible` 是 chat，两者必须先判
+ * 精确的那个——后者也含 `openai` 子串。anthropic 等本工具没有对应的道。
+ */
+function decodeWire(npm) {
+  const value = String(npm ?? '').trim().toLowerCase();
+  if (value.length === 0) return undefined;
+  if (value === '@ai-sdk/openai' || value.endsWith('/openai')) return 'responses';
+  if (value.includes('openai-compatible')) return 'chat';
+  return 'unsupported';
+}
+
 function decodeEffortValues(raw) {
   if (!Array.isArray(raw)) return { effortValues: [] };
   const values = [];
@@ -375,6 +388,8 @@ function decodeModelsDev(data) {
         modalitiesInput: Array.isArray(raw.modalities && raw.modalities.input)
           ? raw.modalities.input.map(String)
           : [],
+        // 逐模型的 npm 覆盖段级默认；没有逐模型声明就走段级（chat）。
+        wire: decodeWire(raw.provider?.npm ?? provider.npm),
         ...decodeEffortValues(raw.reasoning_options),
       });
     }
@@ -403,7 +418,9 @@ function decide(model, prices, ready) {
     nameFree ? { allowed: true, source: 'name_free', known: false } : { allowed: false, source, known: false };
   if (!ready || prices.size === 0) return fallback('metadata_pending');
   const price = prices.get(model);
-  if (!price) return fallback('metadata_model_missing');
+  // 目录里查无此模型：不按名字放行。实时清单里混着大量名字带 free 的
+  // 付费或未核实模型，名字兜底只在「整份元数据都没拉到」时才有意义。
+  if (!price) return { allowed: false, source: 'metadata_model_missing', known: false };
   // 废弃是硬否决，后面的兜底也不许把它捞回来。
   if (price.deprecated) return { allowed: false, source: 'metadata_deprecated', known: true };
   if (price.input === undefined || price.input === 0) {
@@ -463,6 +480,8 @@ class ModelCatalog {
   /** 最近一次成功解析出来的清单与价格（内存快照）。编译期名单已移除。 */
   #lastGoodZen = new Set();
   #lastGoodPrices = new Map();
+  /** 上次拉到的目录 ETag，下次带 If-None-Match，没变就回 304。 */
+  #metadataEtag = null;
   #lastError = '';
   #timer = null;
   #stopped = false;
@@ -498,7 +517,10 @@ class ModelCatalog {
     }
     if (prices.size > 0) {
       this.#prices = prices;
+      this.#lastGoodPrices = new Map(prices);
       this.#pricesReady = true;
+      // 缓存里清单和元数据是同一次写出来的，两者都在才构成可信快照。
+      if (ids.length > 0) this.#lastGoodZen = new Set(ids);
     }
     this.#cacheState = { fingerprint: this.#cacheFingerprint() };
   }
@@ -563,7 +585,11 @@ class ModelCatalog {
       await Promise.allSettled([this.#refreshZen(), this.#refreshMetadata()]);
       this.#saveCache();
       // 只在暴露清单真的变了时回调一次，重复刷新保持安静。
-      const key = this.list().join('|');
+      const exposed = this.list();
+      // 快照记「这次真的被放行的」，而不是整份实时清单。实时清单里混着
+      // 付费和未核实的模型，整份记下来会在元数据抖动时被原样放行。
+      if (exposed.length > 0) this.#lastGoodZen = new Set(exposed);
+      const key = exposed.join('|');
       if (key !== this.#changeKey) {
         const first = this.#changeKey === '';
         this.#changeKey = key;
@@ -583,6 +609,8 @@ class ModelCatalog {
   async #refreshZen() {
     try {
       const ids = await fetchZenModels(this.#fetchImpl);
+      // 空清单不覆盖：上游抖动回了空 body 时，保住上一次的结果。
+      if (ids.length === 0) return;
       this.#zen = new Set(ids);
       this.#updatedAt = Date.now();
       this.#liveAt = this.#updatedAt;
@@ -592,22 +620,38 @@ class ModelCatalog {
     }
   }
 
+  /**
+   * 拉元数据。优先官方目录（models.opencode.ai），它带每个模型的 provider.npm，
+   * 线路判定靠它；拉不到再退回 models.dev 镜像。两者形状相同，同一套解析。
+   * 带上上次的 ETag：目录没变就回 304，不再重下那 5MB。
+   */
   async #refreshMetadata() {
-    try {
-      const response = await withTimeout(
-        this.#fetchImpl(METADATA_URL, { headers: { accept: 'application/json' } }),
-        CATALOG_TIMEOUT_MS,
-        'models.dev fetch',
-      );
-      if (!response.ok) throw new Error(`models.dev returned HTTP ${response.status}`);
-      const prices = decodeModelsDev(await response.json());
-      if (prices.size === 0) throw new Error('models.dev contains no OpenCode model metadata');
-      this.#prices = prices;
-      this.#pricesReady = true;
-      this.#liveAt = Date.now();
-    } catch (err) {
-      if (!this.#pricesReady) this.#lastError = err && err.message ? err.message : String(err);
+    const sources = [CAPABILITIES_URL, METADATA_URL];
+    let lastError = null;
+    for (const url of sources) {
+      try {
+        const headers = { accept: 'application/json' };
+        if (this.#metadataEtag) headers['if-none-match'] = this.#metadataEtag;
+        const response = await withTimeout(
+          this.#fetchImpl(url, { headers }),
+          CATALOG_TIMEOUT_MS,
+          'model metadata fetch',
+        );
+        if (response.status === 304) return;
+        if (!response.ok) throw new Error(`metadata endpoint returned HTTP ${response.status}`);
+        const prices = decodeModelsDev(await response.json());
+        if (prices.size === 0) throw new Error('metadata contains no OpenCode models');
+        this.#prices = prices;
+        this.#lastGoodPrices = new Map(prices);
+        this.#pricesReady = true;
+        this.#liveAt = Date.now();
+        this.#metadataEtag = response.headers.get('etag') || this.#metadataEtag;
+        return;
+      } catch (err) {
+        lastError = err && err.message ? err.message : String(err);
+      }
     }
+    if (!this.#pricesReady && lastError) this.#lastError = lastError;
   }
 
   decision(model) {
@@ -668,10 +712,20 @@ class ModelCatalog {
 // 分道与元数据
 // ---------------------------------------------------------------------------
 
-/** muse-spark-* 只答 /v1/responses，jev-* 只答 /systemone，都不能进 chat 那条道。 */
-function isChatLaneModel(id) {
+/**
+ * 这个模型走哪条线。优先信官方目录里它自己声明的 SDK：`@ai-sdk/openai`
+ * 走 responses，`openai-compatible` 走 chat，anthropic 等本工具代理不了。
+ * 目录没说话时才退回按名字猜——muse-spark 走 responses，jev 走本工具没有的
+ * systemone 道，其余当 chat。
+ */
+function laneFor(id, catalog) {
+  const declared = catalog.metadata(id)?.wire;
+  if (declared === 'unsupported') return null;
+  if (declared === 'chat' || declared === 'responses') return declared;
   const value = String(id ?? '').toLowerCase();
-  return value.length > 0 && !value.startsWith('muse-spark') && !value.startsWith('jev');
+  if (value.length === 0 || value.startsWith('jev')) return null;
+  if (value.startsWith('muse-spark')) return 'responses';
+  return 'chat';
 }
 
 /**
@@ -698,7 +752,7 @@ function catalogEntry(id, catalog) {
 function chatModelEntries(catalog) {
   const out = [];
   for (const id of catalog.list()) {
-    if (!isChatLaneModel(id)) continue;
+    if (laneFor(id, catalog) !== 'chat') continue;
     out.push(catalogEntry(id, catalog));
   }
   return out;
@@ -707,7 +761,7 @@ function chatModelEntries(catalog) {
 function responsesModelEntries(catalog) {
   const out = [];
   for (const id of catalog.list()) {
-    if (!String(id).toLowerCase().startsWith('muse-spark')) continue;
+    if (laneFor(id, catalog) !== 'responses') continue;
     out.push(catalogEntry(id, catalog));
   }
   return out;

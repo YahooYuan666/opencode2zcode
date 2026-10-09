@@ -56,7 +56,10 @@ pub fn client() -> Result<Client, String> {
         .pool_idle_timeout(Duration::from_secs(90))
         .user_agent("opencode2zcode");
 
-    if let Some(proxy) = detect_proxy() {
+    if let Some(mut proxy) = detect_proxy() {
+        // 回环不走代理。自测的 mock 上游就在 127.0.0.1 上，送进系统代理会打到
+        // 别处，表现为「mock 一个请求都收不到」。
+        proxy = proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1"));
         builder = builder.proxy(proxy);
     }
 

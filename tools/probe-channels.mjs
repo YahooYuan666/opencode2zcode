@@ -87,7 +87,7 @@ async function checkProxyHealth(port) {
 }
 
 // 获取待检测的模型列表
-async function discoverModels(port, targetModel) {
+async function discoverModels(port, targetModel, options = {}) {
   const models = [];
 
   // 1. 尝试从本地代理获取已暴露的 chat 模型
@@ -139,27 +139,10 @@ async function discoverModels(port, targetModel) {
     }
   }
 
-  // 3. 内置知名免费模型兜底保底列表
-  const knownFreeModels = [
-    { id: 'big-pickle', lane: 'chat' },
-    { id: 'exo-free', lane: 'chat' },
-    { id: 'fledge-alpha-free', lane: 'chat' },
-    { id: 'ling-3.0-flash-fin-free', lane: 'chat' },
-    { id: 'ling-3.1-flash-free', lane: 'chat' },
-    { id: 'longcat-2.5-preview-free', lane: 'chat' },
-    { id: 'mimo-v2.6-flash-free', lane: 'chat' },
-    { id: 'nemotron-3-ultra-free', lane: 'chat' },
-    { id: 'nemotron-3.5-lightning-free', lane: 'chat' },
-    { id: 'space-bunny-free', lane: 'chat' },
-    { id: 'step-5-preview-free', lane: 'chat' },
-    { id: 'muse-spark-1.3-contributor-free', lane: 'responses' },
-  ];
-
-  for (const k of knownFreeModels) {
-    if (!models.some((item) => item.id === k.id)) {
-      models.push(k);
-    }
-  }
+  // 3. 上游直连发现（关键）：代理只暴露「它判定为免费且未下架」的模型，
+  //    所以有些已死的模型代理**故意不暴露**。要测全「OpenCode 提供的所有渠道」，
+  //    必须自己拉一遍 Zen 实时清单 + models.dev 判定，否则测不到已下架的那些。
+  await discoverFromUpstream(models, options);
 
   if (targetModel) {
     const matched = models.filter((m) => m.id.toLowerCase().includes(targetModel.toLowerCase()));
@@ -168,6 +151,56 @@ async function discoverModels(port, targetModel) {
   }
 
   return models;
+}
+
+/**
+ * 上游直连发现：拉 Zen 实时清单 + models.dev 判定免费，得到「OpenCode 提供的
+ * 全部免费渠道」，包括代理已经不再暴露的那些（已下架/已废弃的模型）。
+ *
+ * 通道判定：代理已配置过的按配置来；没配置过的（上游新上架、代理还没跟上，
+ * 或代理判定其不可用）标成 `unknown`，实测时两条道各试一次，看哪条通。
+ */
+async function discoverFromUpstream(models, options) {
+  const timeoutMs = options.timeoutMs || 25000;
+  let zenIds = [];
+  try {
+    const res = await fetch('https://opencode.ai/zen/v1/models', {
+      headers: {
+        authorization: 'Bearer public',
+        'user-agent': 'opencode/latest/2.0.21/cli',
+        'x-opencode-client': 'cli',
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      zenIds = (data.data || []).map((m) => m.id);
+    }
+  } catch {
+    return; // 上游不可达就只用代理已暴露的，不臆造
+  }
+
+  // models.dev 判定免费（与插件/desktop 的 isFree 规则一致）
+  let freeIds = null;
+  try {
+    const res = await fetch('https://models.dev/api.json', { signal: AbortSignal.timeout(timeoutMs) });
+    const data = await res.json();
+    const modelsMap = (data.providers || data).opencode?.models || {};
+    freeIds = new Set(
+      Object.entries(modelsMap)
+        .filter(([, m]) => (!m.cost || m.cost.input === 0) && (m.status ?? 'none') !== 'deprecated')
+        .map(([id]) => id),
+    );
+  } catch {
+    freeIds = null;
+  }
+
+  for (const id of zenIds) {
+    if (models.some((m) => m.id === id)) continue;
+    // 名字里带 free 的一律纳入（目录数据缺失时，宁可多测也不要漏）
+    if (freeIds && !freeIds.has(id) && !id.toLowerCase().includes('free')) continue;
+    models.push({ id, lane: 'unknown' });
+  }
 }
 
 // 分类体系判定函数
@@ -189,13 +222,30 @@ function classifyError(status, text) {
     };
   }
 
+  // 3.5 需要真实 API key（该模型不在匿名免费通道内）
+  if (
+    lower.includes('missing api key') ||
+    lower.includes('autherror') ||
+    (status === 401 && lower.includes('api key'))
+  ) {
+    return {
+      category: 'NEEDS_API_KEY',
+      statusBadge: '🔑 需真实 API Key',
+      diagnosis: '上游要求有效凭据，该模型不在匿名免费通道内。',
+      suggestion: '本工具用的是匿名免费凭据（public），此模型需要你自己的 OpenCode API key，改代理配置才能用。',
+    };
+  }
+
   // 2. 本身已不再提供免费渠道 / 已废弃 / 已下线
   if (
     status === 410 ||
     lower.includes('modeldeprecated') ||
     lower.includes('has been deprecated') ||
-    status === 401 ||
-    lower.includes('model is not supported') ||
+    // 注意：不要用裸 status===401 —— AuthError(Missing API key) 也是 401，
+    // 那是"需要真实凭据"而非"模型下架"，已在上面单独分类。
+    // 文案里模型名会插在中间（"Model fledge-alpha-free is not supported"），
+    // 所以不能拿整句做字面量匹配。
+    (lower.includes('is not supported') && lower.includes('model')) ||
     (status === 400 && lower.includes('model is unavailable')) ||
     (status === 400 && lower.includes('model not found'))
   ) {
@@ -224,6 +274,16 @@ function classifyError(status, text) {
     };
   }
 
+  // 3.2 该模型不支持当前协议/通道（说明它只存在于别的通道，不是模型本身失效）
+  if (lower.includes('modelprotocolunsupported') || lower.includes('does not support this protocol')) {
+    return {
+      category: 'LANE_UNSUPPORTED',
+      statusBadge: '🚫 该道不支持',
+      diagnosis: '此模型不在当前通道上。',
+      suggestion: '需换用该模型实际所属的通道再判定。',
+    };
+  }
+
   // 4. 免费通道门禁未过
   if (
     status === 403 ||
@@ -247,34 +307,55 @@ function classifyError(status, text) {
   };
 }
 
-// 测试单个模型
-async function probeModel(port, modelInfo, timeoutMs) {
-  const isResponses = modelInfo.lane === 'responses';
-  const url = isResponses
-    ? `http://127.0.0.1:${port}/v1/responses`
-    : `http://127.0.0.1:${port}/v1/chat/completions`;
+/// 上游直连地址与伪装头。systemone 这条道本工具没有代理，只能直连探测。
+const UPSTREAM_BASE = 'https://opencode.ai/zen';
+const UPSTREAM_HEADERS = {
+  authorization: 'Bearer public',
+  'user-agent': 'opencode/latest/2.0.21/cli',
+  'x-opencode-client': 'cli',
+  'x-opencode-session': 'ses_f07de6fa9ffe753Eu4qlyXU0sC',
+  accept: 'application/json',
+};
 
-  const body = isResponses
-    ? {
-        model: modelInfo.id,
-        stream: false,
-        input: 'Hi',
-      }
-    : {
-        model: modelInfo.id,
-        stream: false,
-        messages: [{ role: 'user', content: 'Hi' }],
-      };
+// 测试单个模型（单次请求）
+async function probeOnce(port, modelInfo, timeoutMs) {
+  const lane = modelInfo.lane;
+  const isResponses = lane === 'responses';
+  const isSystemone = lane === 'systemone';
+
+  // systemone 本工具没有代理，直连上游测（否则只能报"连不上本地代理"，是假象）
+  const url = isSystemone
+    ? `${UPSTREAM_BASE}/v1/systemone`
+    : `http://127.0.0.1:${port}/v1/${isResponses ? 'responses' : 'chat/completions'}`;
+
+  const body = isResponses || isSystemone
+    ? { model: modelInfo.id, input: 'Hi' }
+    : { model: modelInfo.id, stream: false, messages: [{ role: 'user', content: 'Hi' }] };
+  if (isSystemone) body.stream = false;
 
   const startTime = Date.now();
   try {
-    const res = await fetch(url, {
+    let res = await fetch(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: isSystemone
+        ? { ...UPSTREAM_HEADERS, 'content-type': 'application/json' }
+        : { 'content-type': 'application/json' },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
 
+    // systemone 道的模型名不带 "-free" 后缀（Zen 清单里带、实际路由不带，
+    // muse-spark 同规律）。命中 400 Invalid request 时去掉后缀重试一次，
+    // 否则这类模型会被永远判成"未能判定"。
+    if (isSystemone && res.status === 400 && modelInfo.id.endsWith('-free')) {
+      const stripped = { ...body, model: modelInfo.id.slice(0, -'-free'.length) };
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { ...UPSTREAM_HEADERS, 'content-type': 'application/json' },
+        body: JSON.stringify(stripped),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    }
     const latencyMs = Date.now() - startTime;
     const rawText = await res.text();
 
@@ -286,46 +367,111 @@ async function probeModel(port, modelInfo, timeoutMs) {
           json.choices?.[0]?.message?.content ||
           json.output?.[0]?.content?.[0]?.text ||
           json.text ||
+          json.content?.[0]?.text ||
           '';
       } catch {
         snippet = rawText.slice(0, 80);
       }
-
       return {
         model: modelInfo.id,
-        lane: modelInfo.lane,
+        lane,
         status: 200,
         latencyMs,
         category: 'ACTIVE',
         statusBadge: '✅ 畅通可用',
-        diagnosis: '模型连接正常，推理输出完整。',
-        suggestion: '可放心在 ZCode 中作为日常模型使用。',
+        diagnosis: isSystemone ? '通过直连上游的 systemone 通道调用成功（本工具未代理该道）。' : '模型连接正常，推理输出完整。',
+        suggestion: isSystemone
+          ? '该模型只能走 systemone 通道，本工具的代理没有这一道，需扩展代理或直连使用。'
+          : '可放心在 ZCode 中作为日常模型使用。',
         snippet: snippet.trim().replace(/\s+/g, ' ').slice(0, 80),
       };
     }
 
-    const classified = classifyError(res.status, rawText);
     return {
       model: modelInfo.id,
-      lane: modelInfo.lane,
+      lane,
       status: res.status,
       latencyMs,
       rawError: rawText,
-      ...classified,
+      ...classifyError(res.status, rawText),
     };
   } catch (err) {
-    const latencyMs = Date.now() - startTime;
     return {
       model: modelInfo.id,
-      lane: modelInfo.lane,
+      lane,
       status: 0,
-      latencyMs,
+      latencyMs: Date.now() - startTime,
       category: 'NETWORK_TIMEOUT',
       statusBadge: '⏱️ 请求超时/中断',
-      diagnosis: `请求本地代理异常: ${err.message}`,
+      diagnosis: `请求异常: ${err.message}`,
       suggestion: '请确认本地代理服务正常运行且端口正确。',
     };
   }
+}
+
+/**
+ * 结果信息量排名（越大越具体）。多道探测时按它择优，避免"未识别错误"
+ * 覆盖掉后续通道给出的精确分类。
+ */
+const RESULT_RANK = {
+  ACTIVE: 100,
+  NEEDS_API_KEY: 80,
+  REGION_BLOCKED: 80,
+  CHANNEL_REMOVED: 80,
+  GATE_FAILED: 75,
+  ENDPOINT_NOT_READY: 60,
+  LANE_UNSUPPORTED: 20,
+  NETWORK_TIMEOUT: 15,
+  UPSTREAM_ERROR: 5,
+};
+const rankResult = (r) => RESULT_RANK[r?.category] ?? 0;
+
+// 瞬时类错误的重试次数：429（IP 频控）/ 5xx 上游抖动 —— 单次不算结论
+const TRANSIENT_RETRY = 2;
+
+/**
+ * 测试单个模型，带瞬时错误重试与双通道探测。
+ *
+ * 429 不作单次结论：实测单发 429 的模型复测两次都是 200，直接报「端点未就绪」
+ * 会给出错误判断。只有连续 N 次都失败，才归为端点未就绪/限流。
+ */
+async function probeModel(port, modelInfo, timeoutMs) {
+  // 通道未知时三道都试：chat / responses / systemone（第三道本工具未代理）
+  const lanes = modelInfo.lane === 'unknown' ? ['chat', 'responses', 'systemone'] : [modelInfo.lane];
+  let best = null;
+  let lastTransient = null;
+
+  for (const lane of lanes) {
+    let attempt = 0;
+    for (;;) {
+      const r = await probeOnce(port, { ...modelInfo, lane }, timeoutMs);
+      const transient = r.status === 429 || r.status === 503 || r.category === 'NETWORK_TIMEOUT';
+      if (transient && attempt < TRANSIENT_RETRY) {
+        attempt += 1;
+        lastTransient = r;
+        await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
+        continue;
+      }
+      // 结果择优：只有 ACTIVE 会覆盖，这会**丢掉后续通道更精确的分类**
+      // （例如 chat 道报"不支持该协议"、systemone 道报"需真实 key"，
+      //  最终却被前者的"未识别错误"盖住，结论退化成"未能判定"）。
+      // 改为按信息量择优：实测可用 > 已识别分类 > 未识别错误。
+      if (!best || rankResult(r) > rankResult(best)) best = r;
+      break;
+    }
+  }
+
+  const result = best || lastTransient;
+  if (result && modelInfo.lane === 'unknown' && result.category === 'UPSTREAM_ERROR') {
+    result.statusBadge = '❔ 未能判定';
+    result.diagnosis = 'chat / responses / systemone 三道均未成功，且错误不属于已知分类。';
+    result.suggestion = '可能是本工具未代理的其它通道，或上游对请求体有额外要求；可查看原始错误。';
+  }
+  if (result.retries) result.note = `（重试 ${result.retries} 次后结论）`;
+  if (result.category === 'ENDPOINT_NOT_READY' && lastTransient) {
+    result.diagnosis = `连续 ${TRANSIENT_RETRY + 1} 次均失败：上游推理端点尚未就绪，或触发 IP 级频控限制。`;
+  }
+  return result;
 }
 
 async function main() {
@@ -352,7 +498,7 @@ async function main() {
   }
 
   // 2. 发现模型
-  const models = await discoverModels(options.port, options.targetModel);
+  const models = await discoverModels(options.port, options.targetModel, options);
 
   if (!options.json) {
     console.log(`\n======================================================`);

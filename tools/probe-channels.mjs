@@ -810,7 +810,7 @@ async function main() {
     const r = await probeModel(options.port, m, options.timeoutMs);
     results.push(r);
     if (!options.json) {
-      console.log(`${r.statusBadge} (${r.latencyMs}ms)`);
+      console.log(r.statusBadge);
     }
     // 适当防频控间隔
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -828,25 +828,15 @@ async function main() {
     return;
   }
 
-  // 生成格式化分类报告
-  const activeList = results.filter((r) => r.category === 'ACTIVE');
-  const regionList = results.filter((r) => r.category === 'REGION_BLOCKED');
-  const removedList = results.filter((r) => r.category === 'CHANNEL_REMOVED');
-  const notReadyList = results.filter((r) => r.category === 'ENDPOINT_NOT_READY');
-  const otherList = results.filter(
-    (r) => !['ACTIVE', 'REGION_BLOCKED', 'CHANNEL_REMOVED', 'ENDPOINT_NOT_READY'].includes(r.category),
-  );
+  // 生成报告：一张表搞定。原先分「连通性看板」和「选型参考」两张，
+  // 用户要的是一眼看全，所以合并成一张，按档位排序。
+  const tierOrder = { S: 0, A: 1, B: 2, C: 3 };
+  const ranked = results
+    .map((r) => ({ r, tier: tierFor(r) }))
+    .sort((a, b) => tierOrder[a.tier.tier] - tierOrder[b.tier.tier]
+      || a.r.model.localeCompare(b.r.model));
 
-  console.log(`\n=================== 📊 连通性检测看板 ===================\n`);
-
-  console.log(`| 模型 ID | 通道 | 状态 | 耗时 | 诊断详情 |`);
-  console.log(`| :--- | :--- | :--- | :--- | :--- |`);
-  for (const r of results) {
-    const detail = r.snippet ? `输出: "${r.snippet}"` : r.diagnosis;
-    console.log(`| **${r.model}** | \`${r.lane}\` | ${r.statusBadge} | ${r.latencyMs}ms | ${detail} |`);
-  }
-
-  console.log(`\n=================== 📐 选型参考：先看档位，再看上下文 ===================\n`);
+  console.log(`\n=================== 📊 OpenCode 免费模型体检报告 ===================\n`);
 
   console.log(
     '> **档位只看"现在能不能调通"，不评价模型聪明不聪明。** S 闭眼用，A 换节点用，',
@@ -864,12 +854,6 @@ async function main() {
     '> 对不上的（榜单里没有对应基座）显示"—"，不扣分、不降级，只是不佐证。\n',
   );
 
-  const tierOrder = { S: 0, A: 1, B: 2, C: 3 };
-  const ranked = results
-    .map((r) => ({ r, tier: tierFor(r) }))
-    .sort((a, b) => tierOrder[a.tier.tier] - tierOrder[b.tier.tier]
-      || a.r.model.localeCompare(b.r.model));
-
   const deprecatedButAlive = ranked.filter(
     ({ r }) => r.spec?.deprecated && r.category === 'ACTIVE',
   );
@@ -882,13 +866,19 @@ async function main() {
     console.log('> 这也是它们不出现在 ZCode 模型列表里的原因——宁可少给，不给随时会失效的。\n');
   }
 
-  console.log(`| 模型 | 状态 | 上下文 | 档位 | 社区热度（OpenRouter 日榜） |`);
+  console.log(`| 模型 ID | 状态及核心诊断 | 上下文 | 档位 | 社区热度 |`);
   console.log(`| :--- | :--- | ---: | :---: | :--- |`);
   for (const { r, tier } of ranked) {
     const spec = r.spec;
     const ctx = spec ? formatTokens(spec.contextWindow) : '未知';
-    // 目录标了废弃的，状态后面跟一句——实测仍通只是"现在还能用"，不是长期保证。
-    const statusCell = spec?.deprecated ? `${r.statusBadge} ⚠️目录已废弃` : r.statusBadge;
+    // 状态列带一句核心诊断，用户不用翻后面的清单就知道该怎么办。
+    // 目录标了废弃的补一句——实测仍通只是"现在还能用"，不是长期保证。
+    const deprecated = spec?.deprecated ? ' ⚠️目录已废弃' : '';
+    // 畅通的模型不用展示输出内容——HTTP 200 已经证明它能用了，
+    // 输出多半是"Hi there!"这类打招呼，纯噪音还挤爆表格。
+    // 只有异常状态才需要一句诊断，告诉用户到底怎么回事。
+    const detail = r.category === 'ACTIVE' ? '' : `<br>${r.diagnosis}`;
+    const statusCell = `${r.statusBadge}${deprecated}${detail}`;
     const tierCell = `**${tier.tier}** ${tier.label}`;
     const heat = r.popularity
       ? `${formatRank(r.popularity)} · ${formatCount(r.popularity.count)}`
@@ -897,51 +887,48 @@ async function main() {
   }
   console.log();
 
-  console.log(`\n=================== 💡 详细归因与行动建议 ===================\n`);
+  console.log(`\n=================== 💡 行动建议 ===================\n`);
 
-  if (activeList.length > 0) {
-    console.log(`### ✅ 畅通可用模型 (${activeList.length} 个)`);
-    console.log(`> 这些模型当前随时可在 ZCode 对话中正常使用：`);
-    for (const r of activeList) {
-      console.log(`- **${r.model}** (${r.latencyMs}ms)`);
+  const byTier = (tier) => ranked.filter((x) => x.tier.tier === tier);
+  const sList = byTier('S');
+  const aList = byTier('A');
+  const bList = byTier('B');
+  const cList = byTier('C');
+
+  if (sList.length > 0) {
+    console.log(`### ✅ S 主力可用 (${sList.length} 个)：直接用，无需任何操作`);
+    // 同为 S 档时按上下文从大到小推荐，长文档场景优先。
+    for (const { r } of sList.slice().sort((a, b) =>
+      (b.r.spec?.contextWindow ?? 0) - (a.r.spec?.contextWindow ?? 0))) {
+      const ctx = r.spec ? formatTokens(r.spec.contextWindow) : '未知';
+      const heat = r.popularity ? `、热度 ${formatRank(r.popularity)}` : '';
+      const warn = r.spec?.deprecated ? '（目录已废弃，建议只作临时备用）' : '';
+      console.log(`- **${r.model}** — 上下文 ${ctx}${heat}${warn}`);
     }
     console.log();
   }
 
-  if (regionList.length > 0) {
-    console.log(`### 🌍 网络位置/地区受限模型 (${regionList.length} 个)`);
-    console.log(`> ⚠️ **核心说明**：此问题**不是**模型下架失效，而是因为上游对当前出口 IP 所在国家/地区限制。`);
-    for (const r of regionList) {
-      console.log(`- **${r.model}** (上游错误: ${r.status})`);
-      console.log(`  - 处方: 切换代理节点至支持的区域（如香港、新加坡、美国、日本等）后即可正常连接。`);
+  if (aList.length > 0) {
+    console.log(`### 🌍 A 换节点可用 (${aList.length} 个)：模型没问题，换代理节点即可`);
+    for (const { r } of aList) {
+      console.log(`- **${r.model}** — 切换到香港/新加坡/美国/日本等节点后重试`);
     }
     console.log();
   }
 
-  if (removedList.length > 0) {
-    console.log(`### 🚫 官方已下架/已废弃模型 (${removedList.length} 个)`);
-    console.log(`> ⚠️ **核心说明**：上游已从免费渠道或推理后端永久撤下，**更换任何代理节点都无法使用**。`);
-    for (const r of removedList) {
-      console.log(`- **${r.model}** (状态码: ${r.status})`);
-      console.log(`  - 处方: 渠道已永久失效，建议在模型选择器中忽略或隐藏。`);
+  if (bList.length > 0) {
+    console.log(`### ⏳ B 暂不可用 (${bList.length} 个)：临时状态，过阵子再试`);
+    for (const { r } of bList) {
+      console.log(`- **${r.model}** — ${r.diagnosis}`);
     }
     console.log();
   }
 
-  if (notReadyList.length > 0) {
-    console.log(`### ⏳ 端点未就绪 / 临时排队熔断模型 (${notReadyList.length} 个)`);
-    console.log(`> ⚠️ **核心说明**：官方已公布但在上游暂未开机路由（如新出的预览模型），或触发了并发限流。`);
-    for (const r of notReadyList) {
-      console.log(`- **${r.model}** (状态码: ${r.status})`);
-      console.log(`  - 说明: 如 \`exo-free\` 属于上游刚挂牌预览但推理端点尚未接入流量；可关注官方后续开机。`);
-    }
-    console.log();
-  }
-
-  if (otherList.length > 0) {
-    console.log(`### ⚠️ 其它异常模型 (${otherList.length} 个)`);
-    for (const r of otherList) {
-      console.log(`- **${r.model}**: ${r.diagnosis}`);
+  if (cList.length > 0) {
+    console.log(`### 🚫 C 当前不可用 (${cList.length} 个)：别浪费时间`);
+    for (const { r } of cList) {
+      console.log(`- **${r.model}** — ${r.diagnosis}`);
+      console.log(`  - 处方: ${r.suggestion}`);
     }
     console.log();
   }

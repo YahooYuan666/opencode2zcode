@@ -372,16 +372,28 @@ async function attachPopularity(models, options) {
   } catch {
     return; // 榜单拉不到就降级：探测照常，报告里不显示热度
   }
+  // 榜单接口返回的是**按消费额（美元）降序**的顺序，不是按调用量。
+  // 直接用下标当名次会得出「调用 10 亿次却排 #283、调用 1700 万次却排 #1」
+  // 这种自相矛盾的结果——调用量大的便宜模型会被排到很后面，名次和
+  // 显示的调用次数自相矛盾，用户一眼就觉得数据错了。
+  // 所以自己按 count 降序重算名次。
+  const byCount = [...rows].sort((a, b) => (b.count || 0) - (a.count || 0));
+  const rankBySlug = new Map();
+  byCount.forEach((row, index) => {
+    const slug = String(row.model_permaslug || '');
+    if (slug && !rankBySlug.has(slug)) rankBySlug.set(slug, index + 1);
+  });
+
   for (const m of models) {
     const hit = matchRankRow(m.id, rows);
     if (!hit) {
       m.popularity = null;
       continue;
     }
-    const rank = rows.indexOf(hit) + 1;
     m.popularity = {
       slug: hit.model_permaslug,
-      rank,
+      // 按调用量重算的名次。
+      rank: rankBySlug.get(String(hit.model_permaslug)) || null,
       of: rows.length,
       count: hit.count || 0,
     };

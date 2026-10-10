@@ -185,6 +185,8 @@ async function discoverFromUpstream(models, options) {
   // 官方目录拉不到时退回 models.dev 镜像，两者形状相同。
   let freeIds = null;
   const declaredLane = new Map();
+  /** modelId → 官方目录原始条目。报告据此展开规格，目录里没有的留空不猜。 */
+  const catalogMeta = new Map();
   for (const url of ['https://models.opencode.ai/api.json', 'https://models.dev/api.json']) {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
@@ -199,6 +201,7 @@ async function discoverFromUpstream(models, options) {
       );
       for (const [id, m] of Object.entries(modelsMap)) {
         declaredLane.set(id, laneFromNpm(m.provider?.npm ?? section.npm));
+        catalogMeta.set(id, m);
       }
       break;
     } catch {
@@ -244,6 +247,14 @@ async function discoverFromUpstream(models, options) {
     }
     models.push({ id, lane: declaredLane.get(id) || 'unknown' });
   }
+
+  // 规格挂在每个模型上，报告表和 JSON 输出都能用。代理/配置里发现的模型
+  // 同样补一份——它们本来就在目录里，不补就看不到规格。
+  for (const m of models) {
+    const meta = catalogMeta.get(m.id);
+    m.spec = meta ? specFromCatalog(meta) : null;
+    if (!m.lane) m.lane = declaredLane.get(m.id) || 'unknown';
+  }
 }
 
 /** 官方目录的 SDK 包名 → 线路。没声明或本工具代理不了的，交给实测去试。 */
@@ -252,6 +263,131 @@ function laneFromNpm(npm) {
   if (value === '@ai-sdk/openai' || value.endsWith('/openai')) return 'responses';
   if (value.includes('openai-compatible')) return 'chat';
   return null;
+}
+
+/**
+ * 官方目录条目 → 选型要看的规格。字段全部来自目录原文，不做任何推测：
+ * 目录没写的就是 null，报告里显示「未知」而不是编一个数。
+ */
+function specFromCatalog(meta) {
+  const limit = meta.limit || {};
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null);
+  const effortValues = [];
+  for (const option of Array.isArray(meta.reasoning_options) ? meta.reasoning_options : []) {
+    if (option?.type !== 'effort' || !Array.isArray(option.values)) continue;
+    for (const value of option.values) {
+      if (typeof value === 'string' && value && !effortValues.includes(value)) effortValues.push(value);
+    }
+  }
+  return {
+    displayName: typeof meta.name === 'string' && meta.name ? meta.name : null,
+    contextWindow: num(limit.context),
+    maxOutput: num(limit.output),
+    reasoning: meta.reasoning === true,
+    effortValues,
+    toolCall: meta.tool_call === true,
+    structuredOutput: meta.structured_output === true,
+    inputModalities: Array.isArray(meta.modalities?.input)
+      ? meta.modalities.input.map(String)
+      : [],
+    /** 目录标了 deprecated：实测可能仍通，但上游随时会撤，选型要知道。 */
+    deprecated: metaDeprecated(meta),
+  };
+}
+
+function metaDeprecated(meta) {
+  if (meta.deprecated === true) return true;
+  const status = String(meta.status ?? meta.lifecycle ?? '').toLowerCase();
+  return status === 'deprecated' || status === 'retired' || status === 'disabled';
+}
+
+/**
+ * 规格参考分的逐项明细与总分。
+ *
+ * **这不是模型能力评分，也不是社区评分**：目前没有任何社区榜单或公开基准
+ * 覆盖 Zen 免费模型，这里只是把目录里已经写明的纸面参数按固定权重折算，
+ * 方便横向对照"配置上限"。权重与口径和 provider-fetcher 完全一致
+ * （上下文 40 / 最大输出 20 / 推理档位 15 / 工具调用 15 / 多模态输入 6 /
+ * 结构化输出 4，合计 100），两个工具对同一模型给出的分数相同。
+ * 纸面参数漂亮不代表实际表现好，选型以自己的实测为准。
+ */
+const SPEC_WEIGHTS = {
+  context: 40,
+  output: 20,
+  reasoning: 15,
+  toolCall: 15,
+  modalities: 6,
+  structured: 4,
+};
+
+/** 明细标签用中文，和表头一致；顺序即折算顺序。 */
+const SPEC_LABELS = [
+  ['context', '上下文'],
+  ['output', '最大输出'],
+  ['reasoning', '推理档位'],
+  ['toolCall', '工具调用'],
+  ['modalities', '多模态输入'],
+  ['structured', '结构化输出'],
+];
+
+function contextPoints(value) {
+  if (value === null) return 0;
+  for (const [threshold, points] of [[1_000_000, 40], [400_000, 34], [200_000, 28], [128_000, 22], [32_000, 12]]) {
+    if (value >= threshold) return points;
+  }
+  return 6;
+}
+
+function outputPoints(value) {
+  if (value === null) return 0;
+  for (const [threshold, points] of [[256_000, 20], [128_000, 16], [64_000, 12], [32_000, 8]]) {
+    if (value >= threshold) return points;
+  }
+  return 4;
+}
+
+function reasoningPoints(spec) {
+  if (!spec.reasoning) return 0;
+  const levels = spec.effortValues;
+  if (levels.some((level) => level === 'max' || level === 'xhigh')) return 15;
+  if (levels.length >= 3) return 10;
+  return 5;
+}
+
+function specBreakdown(spec) {
+  if (!spec) return null;
+  return {
+    context: contextPoints(spec.contextWindow),
+    output: outputPoints(spec.maxOutput),
+    reasoning: reasoningPoints(spec),
+    toolCall: spec.toolCall ? SPEC_WEIGHTS.toolCall : 0,
+    modalities: Math.min(SPEC_WEIGHTS.modalities, 2 * Math.max(0, spec.inputModalities.length - 1)),
+    structured: spec.structuredOutput ? SPEC_WEIGHTS.structured : 0,
+  };
+}
+
+function specScore(spec) {
+  const breakdown = specBreakdown(spec);
+  if (!breakdown) return null;
+  return Object.values(breakdown).reduce((sum, points) => sum + points, 0);
+}
+
+/** 1245184 → "1.2M"，128000 → "128K"。报告里一眼看得出量级。 */
+function formatTokens(value) {
+  if (value === null) return '未知';
+  if (value >= 1_000_000) {
+    const millions = value / 1_000_000;
+    return `${Number.isInteger(millions) ? millions : millions.toFixed(1)}M`;
+  }
+  if (value >= 1000) return `${Math.round(value / 1000)}K`;
+  return String(value);
+}
+
+/** 档位阶梯："none" 是关闭思考，报告里显示成 off 更像人话。 */
+function formatEfforts(spec) {
+  if (!spec || !spec.reasoning) return '—';
+  const levels = spec.effortValues.map((v) => (v === 'none' ? 'off' : v));
+  return levels.length > 0 ? levels.join(' → ') : '支持';
 }
 
 // 分类体系判定函数
@@ -435,6 +571,7 @@ async function probeOnce(port, modelInfo, timeoutMs) {
           ? '该模型只能走 systemone 通道，本工具的代理没有这一道，需扩展代理或直连使用。'
           : '可放心在 ZCode 中作为日常模型使用。',
         snippet: snippet.trim().replace(/\s+/g, ' ').slice(0, 80),
+        spec: modelInfo.spec ?? null,
       };
     }
 
@@ -445,6 +582,7 @@ async function probeOnce(port, modelInfo, timeoutMs) {
       latencyMs,
       rawError: rawText,
       ...classifyError(res.status, rawText),
+      spec: modelInfo.spec ?? null,
     };
   } catch (err) {
     return {
@@ -456,6 +594,7 @@ async function probeOnce(port, modelInfo, timeoutMs) {
       statusBadge: '⏱️ 请求超时/中断',
       diagnosis: `请求异常: ${err.message}`,
       suggestion: '请确认本地代理服务正常运行且端口正确。',
+      spec: modelInfo.spec ?? null,
     };
   }
 }
@@ -573,7 +712,9 @@ async function main() {
   }
 
   if (options.json) {
-    console.log(JSON.stringify({ ok: true, proxy: proxyHealth.data, results }, null, 2));
+    // rawError 是上游报错原文，仅供人看；JSON 输出只留下分类与诊断，不往外倒原文。
+    const safe = results.map(({ rawError, ...rest }) => rest);
+    console.log(JSON.stringify({ ok: true, proxy: proxyHealth.data, results: safe }, null, 2));
     return;
   }
 
@@ -594,6 +735,64 @@ async function main() {
     const detail = r.snippet ? `输出: "${r.snippet}"` : r.diagnosis;
     console.log(`| **${r.model}** | \`${r.lane}\` | ${r.statusBadge} | ${r.latencyMs}ms | ${detail} |`);
   }
+
+  console.log(`\n=================== 📐 规格与选型参考 ===================\n`);
+
+  console.log(
+    '> **先说清楚：这里没有社区评分。** 目前没有任何社区榜单或公开基准覆盖 Zen 免费模型，',
+  );
+  console.log(
+    '> 下面是官方目录里写明的纸面参数，加上本工具按固定权重折算的「规格参考分」。权重口径与',
+  );
+  console.log(
+    '> provider-fetcher 完全一致（上下文 40 / 最大输出 20 / 推理档位 15 / 工具调用 15 /',
+  );
+  console.log(
+    '> 多模态输入 6 / 结构化输出 4，满分 100），两个工具对同一模型给出的分数相同。',
+  );
+  console.log(
+    '> **纸面参数好看不代表实际表现好**，选型请以自己的实测为准。连通性见上一张表。',
+  );
+  console.log(
+    '> 用法：上下文决定能吃多长的文档；档位越多可调的思考深度越细；图像输入决定能不能贴图。\n',
+  );
+
+  const scored = results
+    .map((r) => ({ r, score: specScore(r.spec) }))
+    .sort((a, b) => (b.score ?? -1) - (a.score ?? -1) || a.r.model.localeCompare(b.r.model));
+
+  const deprecatedButAlive = scored.filter(
+    ({ r }) => r.spec?.deprecated && r.category === 'ACTIVE',
+  );
+  if (deprecatedButAlive.length > 0) {
+    console.log(
+      `> ⚠️ ${deprecatedButAlive.length} 个模型**目录已标废弃但实测仍通**（${deprecatedButAlive
+        .map(({ r }) => `\`${r.model}\``)
+        .join('、')}）。现在能调，但上游随时会撤，别作为长期依赖。`,
+    );
+    console.log('> 这也是它们不出现在 ZCode 模型列表里的原因——宁可少给，不给随时会失效的。\n');
+  }
+
+  console.log(`| 模型 ID | 状态 | 上下文窗口 | 最大输出 | 推理档位 | 图像 | 工具调用 | 结构化 | 规格参考分 |`);
+  console.log(`| :--- | :--- | ---: | ---: | :--- | :---: | :---: | :---: | ---: |`);
+  for (const { r, score } of scored) {
+    const spec = r.spec;
+    const breakdown = specBreakdown(spec);
+    const scoreCell = score === null
+      ? '未知'
+      : `**${score}**/100<br>${SPEC_LABELS
+        .map(([key, label]) => `${label} ${breakdown[key]}/${SPEC_WEIGHTS[key]}`)
+        .join(' · ')}`;
+    // 目录标了废弃的，状态后面跟一句——实测仍通只是"现在还能用"，不是长期保证。
+    const statusCell = spec?.deprecated ? `${r.statusBadge} ⚠️目录已废弃` : r.statusBadge;
+    console.log(
+      `| **${r.model}** | ${statusCell} | ${spec ? formatTokens(spec.contextWindow) : '未知'} | `
+      + `${spec ? formatTokens(spec.maxOutput) : '未知'} | ${spec ? formatEfforts(spec) : '未知'} | `
+      + `${spec && spec.inputModalities.includes('image') ? '✅' : '—'} | `
+      + `${spec?.toolCall ? '✅' : '—'} | ${spec?.structuredOutput ? '✅' : '—'} | ${scoreCell} |`,
+    );
+  }
+  console.log();
 
   console.log(`\n=================== 💡 详细归因与行动建议 ===================\n`);
 

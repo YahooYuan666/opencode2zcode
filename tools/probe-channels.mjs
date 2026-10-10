@@ -23,10 +23,70 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, '..');
+
+/**
+ * 出境请求走系统代理（Clash 之类）。Node 的 fetch 不读 Windows 注册表，
+ * 不设的话出境直连会被墙，榜单这类只有墙外才有的接口就拉不到。
+ *
+ * 注意：NODE_USE_ENV_PROXY 只在进程启动时读一次，启动后在脚本里设是无效的。
+ * 所以这里用自举：如果还没设代理变量，就读注册表拿到地址，带上变量重新拉起
+ * 自己（最多一次，用 O2Z_PROXY_BOOTSTRAP 防循环）。回环不受影响：NO_PROXY 护着
+ * localhost/127.0.0.1，本地代理探测和回环代理直连。
+ */
+function readSystemProxy() {
+  if (process.env.https_proxy || process.env.HTTPS_PROXY || process.env.NODE_USE_ENV_PROXY) return null;
+  if (process.env.O2Z_PROXY_BOOTSTRAP) return null;
+  let server = '';
+  try {
+    const key = ['HKCU', 'Software', 'Microsoft', 'Windows', 'CurrentVersion', 'Internet Settings'].join('\\');
+    const out = execFileSync(
+      'reg',
+      ['query', key, '/v', 'ProxyServer'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    const m = out.match(/ProxyServer\s+REG_SZ\s+(\S+)/);
+    server = (m?.[1] || '').trim();
+  } catch {}
+  if (!server) return null;
+  // "http=..;https=..;socks=.." 取 https 段，裸 "host:port" 直接用。
+  let target = server;
+  for (const part of server.split(';')) {
+    const p = part.trim();
+    if (p.startsWith('https=')) { target = p.slice('https='.length); break; }
+    if (!p.includes('=')) target = p;
+  }
+  if (!/^https?:\/\//i.test(target)) target = `http://${target}`;
+  return target;
+}
+
+async function bootstrapViaSystemProxy() {
+  const target = readSystemProxy();
+  if (!target) return false;
+  const { spawnSync } = await import('node:child_process');
+  const env = {
+    ...process.env,
+    https_proxy: target,
+    HTTPS_PROXY: target,
+    http_proxy: target,
+    HTTP_PROXY: target,
+    NO_PROXY: 'localhost,127.0.0.1',
+    no_proxy: 'localhost,127.0.0.1',
+    NODE_USE_ENV_PROXY: '1',
+    O2Z_PROXY_BOOTSTRAP: '1',
+  };
+  const r = spawnSync(process.execPath, [process.argv[1], ...process.argv.slice(2)], {
+    env,
+    stdio: 'inherit',
+  });
+  process.exit(r.status ?? 0);
+  return true;
+}
+await bootstrapViaSystemProxy();
 
 // 默认配置
 const DEFAULT_PORT = 41930;
@@ -146,9 +206,10 @@ async function discoverModels(port, targetModel, options = {}) {
 
   if (targetModel) {
     const matched = models.filter((m) => m.id.toLowerCase().includes(targetModel.toLowerCase()));
+    // 榜单这一步已经在 discoverFromUpstream 里做完，单测命中的模型同样带规格与热度。
     if (matched.length > 0) return matched;
     // 目录里查不到时不按名字猜线路，三道都试，让实测结果说话。
-    return [{ id: targetModel, lane: 'unknown' }];
+    return [{ id: targetModel, lane: 'unknown', spec: null, popularity: null }];
   }
 
   return models;
@@ -255,6 +316,76 @@ async function discoverFromUpstream(models, options) {
     m.spec = meta ? specFromCatalog(meta) : null;
     if (!m.lane) m.lane = declaredLane.get(m.id) || 'unknown';
   }
+
+  // OpenRouter 使用量榜单：第三方真实调用热度，用来给"档位"做佐证。
+  // 拉不到就整体降级（不阻塞探测），每个模型只是少了热度字段。
+  await attachPopularity(models, options);
+}
+
+/**
+ * Zen 免费 id → OpenRouter 基座 slug 片段。
+ *
+ * Zen 免费模型全是各家厂商模型的免费/预览变体（如 muse-spark-1.3-contributor-free
+ * 对应 meta/muse-spark-1.3-contributor-20260902），榜单上没有同名条目。
+ * 规则：去掉 -free 后缀，按包含关系匹配；big-pickle、exo、longcat、fledge
+ * 这些榜单里没有的，对不上就认——不硬凑。
+ */
+function popularityKey(zenId) {
+  return zenId.toLowerCase().replace(/-free$/, '');
+}
+
+function matchRankRow(zenId, rows) {
+  const key = popularityKey(zenId);
+  if (!key) return null;
+  let best = null;
+  for (const row of rows) {
+    const slug = String(row.model_permaslug || '').toLowerCase();
+    if (!slug) continue;
+    const tail = slug.split('/').pop();
+    if (slug.includes(key) || tail.includes(key) || key.includes(tail)) {
+      // 同一基座多个变体时取调用量最大的那个。
+      if (!best || (row.count || 0) > (best.count || 0)) best = row;
+    }
+  }
+  return best;
+}
+
+/**
+ * 拉 OpenRouter 日榜（免 key），给每个模型挂上基座的调用量与全站排名。
+ *
+ * 这是"真实调用热度"，不是"能力跑分"：调用量大说明用的人多、生态成熟，
+ * 不能反推模型能力强。报告里必须带着这个限定说。
+ * 榜单 655 个模型，Zen 免费里约 11/15 能对上基座；对不上的不降级、
+ * 不扣分，只是没有热度佐证。
+ */
+async function attachPopularity(models, options) {
+  const timeoutMs = options.timeoutMs || 25000;
+  let rows = null;
+  try {
+    const res = await fetch('https://openrouter.ai/api/frontend/v1/rankings/models', {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    rows = Array.isArray(data) ? data : data.data;
+    if (!Array.isArray(rows) || rows.length === 0) return;
+  } catch {
+    return; // 榜单拉不到就降级：探测照常，报告里不显示热度
+  }
+  for (const m of models) {
+    const hit = matchRankRow(m.id, rows);
+    if (!hit) {
+      m.popularity = null;
+      continue;
+    }
+    const rank = rows.indexOf(hit) + 1;
+    m.popularity = {
+      slug: hit.model_permaslug,
+      rank,
+      of: rows.length,
+      count: hit.count || 0,
+    };
+  }
 }
 
 /** 官方目录的 SDK 包名 → 线路。没声明或本工具代理不了的，交给实测去试。 */
@@ -301,77 +432,6 @@ function metaDeprecated(meta) {
   return status === 'deprecated' || status === 'retired' || status === 'disabled';
 }
 
-/**
- * 规格参考分的逐项明细与总分。
- *
- * **这不是模型能力评分，也不是社区评分**：目前没有任何社区榜单或公开基准
- * 覆盖 Zen 免费模型，这里只是把目录里已经写明的纸面参数按固定权重折算，
- * 方便横向对照"配置上限"。权重与口径和 provider-fetcher 完全一致
- * （上下文 40 / 最大输出 20 / 推理档位 15 / 工具调用 15 / 多模态输入 6 /
- * 结构化输出 4，合计 100），两个工具对同一模型给出的分数相同。
- * 纸面参数漂亮不代表实际表现好，选型以自己的实测为准。
- */
-const SPEC_WEIGHTS = {
-  context: 40,
-  output: 20,
-  reasoning: 15,
-  toolCall: 15,
-  modalities: 6,
-  structured: 4,
-};
-
-/** 明细标签用中文，和表头一致；顺序即折算顺序。 */
-const SPEC_LABELS = [
-  ['context', '上下文'],
-  ['output', '最大输出'],
-  ['reasoning', '推理档位'],
-  ['toolCall', '工具调用'],
-  ['modalities', '多模态输入'],
-  ['structured', '结构化输出'],
-];
-
-function contextPoints(value) {
-  if (value === null) return 0;
-  for (const [threshold, points] of [[1_000_000, 40], [400_000, 34], [200_000, 28], [128_000, 22], [32_000, 12]]) {
-    if (value >= threshold) return points;
-  }
-  return 6;
-}
-
-function outputPoints(value) {
-  if (value === null) return 0;
-  for (const [threshold, points] of [[256_000, 20], [128_000, 16], [64_000, 12], [32_000, 8]]) {
-    if (value >= threshold) return points;
-  }
-  return 4;
-}
-
-function reasoningPoints(spec) {
-  if (!spec.reasoning) return 0;
-  const levels = spec.effortValues;
-  if (levels.some((level) => level === 'max' || level === 'xhigh')) return 15;
-  if (levels.length >= 3) return 10;
-  return 5;
-}
-
-function specBreakdown(spec) {
-  if (!spec) return null;
-  return {
-    context: contextPoints(spec.contextWindow),
-    output: outputPoints(spec.maxOutput),
-    reasoning: reasoningPoints(spec),
-    toolCall: spec.toolCall ? SPEC_WEIGHTS.toolCall : 0,
-    modalities: Math.min(SPEC_WEIGHTS.modalities, 2 * Math.max(0, spec.inputModalities.length - 1)),
-    structured: spec.structuredOutput ? SPEC_WEIGHTS.structured : 0,
-  };
-}
-
-function specScore(spec) {
-  const breakdown = specBreakdown(spec);
-  if (!breakdown) return null;
-  return Object.values(breakdown).reduce((sum, points) => sum + points, 0);
-}
-
 /** 1245184 → "1.2M"，128000 → "128K"。报告里一眼看得出量级。 */
 function formatTokens(value) {
   if (value === null) return '未知';
@@ -383,11 +443,41 @@ function formatTokens(value) {
   return String(value);
 }
 
-/** 档位阶梯："none" 是关闭思考，报告里显示成 off 更像人话。 */
-function formatEfforts(spec) {
-  if (!spec || !spec.reasoning) return '—';
-  const levels = spec.effortValues.map((v) => (v === 'none' ? 'off' : v));
-  return levels.length > 0 ? levels.join(' → ') : '支持';
+/**
+ * 实测状态 → 档位。只看"现在能不能调通"，不看参数：
+ *   S  实测畅通
+ *   A  地区受限（换节点就能用，模型本身没问题）
+ *   B  端点未就绪或限流（临时状态，过阵子可能好）
+ *   C  官方已下架、门禁拦截、需真实 key、未知错误（现在调不通）
+ *
+ * 档位解决的是"你先试哪个"：S 闭眼用，A 换节点用，B 等一等，C 别浪费时间。
+ * 它回答不了"A 模型和 B 模型谁更聪明"——那是能力问题，不是连通问题。
+ */
+function tierFor(result) {
+  switch (result.category) {
+    case 'ACTIVE':
+      return { tier: 'S', label: '主力可用' };
+    case 'REGION_BLOCKED':
+      return { tier: 'A', label: '换节点可用' };
+    case 'ENDPOINT_NOT_READY':
+      return { tier: 'B', label: '暂不可用' };
+    default:
+      return { tier: 'C', label: '当前不可用' };
+  }
+}
+
+/** 1245184 → "1.2M"。无数据时显示"—"，不编数。 */
+function formatRank(popularity) {
+  if (!popularity) return '—';
+  return `#${popularity.rank}/${popularity.of}`;
+}
+
+/** 调用量 42351013 → "4235万次/日"，太小的如实写。 */
+function formatCount(count) {
+  if (!count) return '—';
+  if (count >= 100_000_000) return `${(count / 100_000_000).toFixed(1)}亿次/日`;
+  if (count >= 10_000) return `${Math.round(count / 10_000)}万次/日`;
+  return `${count}次/日`;
 }
 
 // 分类体系判定函数
@@ -572,6 +662,7 @@ async function probeOnce(port, modelInfo, timeoutMs) {
           : '可放心在 ZCode 中作为日常模型使用。',
         snippet: snippet.trim().replace(/\s+/g, ' ').slice(0, 80),
         spec: modelInfo.spec ?? null,
+        popularity: modelInfo.popularity ?? null,
       };
     }
 
@@ -583,6 +674,7 @@ async function probeOnce(port, modelInfo, timeoutMs) {
       rawError: rawText,
       ...classifyError(res.status, rawText),
       spec: modelInfo.spec ?? null,
+        popularity: modelInfo.popularity ?? null,
     };
   } catch (err) {
     return {
@@ -595,6 +687,7 @@ async function probeOnce(port, modelInfo, timeoutMs) {
       diagnosis: `请求异常: ${err.message}`,
       suggestion: '请确认本地代理服务正常运行且端口正确。',
       spec: modelInfo.spec ?? null,
+        popularity: modelInfo.popularity ?? null,
     };
   }
 }
@@ -713,7 +806,12 @@ async function main() {
 
   if (options.json) {
     // rawError 是上游报错原文，仅供人看；JSON 输出只留下分类与诊断，不往外倒原文。
-    const safe = results.map(({ rawError, ...rest }) => rest);
+    // 档位与热度带上，方便 skill / agent 直接消费。
+    const safe = results.map(({ rawError, ...rest }) => ({
+      ...rest,
+      tier: tierFor(rest).tier,
+      tierLabel: tierFor(rest).label,
+    }));
     console.log(JSON.stringify({ ok: true, proxy: proxyHealth.data, results: safe }, null, 2));
     return;
   }
@@ -736,32 +834,31 @@ async function main() {
     console.log(`| **${r.model}** | \`${r.lane}\` | ${r.statusBadge} | ${r.latencyMs}ms | ${detail} |`);
   }
 
-  console.log(`\n=================== 📐 规格与选型参考 ===================\n`);
+  console.log(`\n=================== 📐 选型参考：先看档位，再看上下文 ===================\n`);
 
   console.log(
-    '> **先说清楚：这里没有社区评分。** 目前没有任何社区榜单或公开基准覆盖 Zen 免费模型，',
+    '> **档位只看"现在能不能调通"，不评价模型聪明不聪明。** S 闭眼用，A 换节点用，',
   );
   console.log(
-    '> 下面是官方目录里写明的纸面参数，加上本工具按固定权重折算的「规格参考分」。权重口径与',
+    '> B 过阵子再试，C 别浪费时间。参数相同的两个模型能力可能天差地别——想知道谁更强，',
   );
   console.log(
-    '> provider-fetcher 完全一致（上下文 40 / 最大输出 20 / 推理档位 15 / 工具调用 15 /',
+    '> 看"社区热度"列：那是 OpenRouter 全站真实调用量（655 个模型的日榜），用的人多',
   );
   console.log(
-    '> 多模态输入 6 / 结构化输出 4，满分 100），两个工具对同一模型给出的分数相同。',
+    '> 说明生态成熟、踩坑的人多，但**热度高不等于能力强**，只是个第三方佐证。',
   );
   console.log(
-    '> **纸面参数好看不代表实际表现好**，选型请以自己的实测为准。连通性见上一张表。',
-  );
-  console.log(
-    '> 用法：上下文决定能吃多长的文档；档位越多可调的思考深度越细；图像输入决定能不能贴图。\n',
+    '> 对不上的（榜单里没有对应基座）显示"—"，不扣分、不降级，只是不佐证。\n',
   );
 
-  const scored = results
-    .map((r) => ({ r, score: specScore(r.spec) }))
-    .sort((a, b) => (b.score ?? -1) - (a.score ?? -1) || a.r.model.localeCompare(b.r.model));
+  const tierOrder = { S: 0, A: 1, B: 2, C: 3 };
+  const ranked = results
+    .map((r) => ({ r, tier: tierFor(r) }))
+    .sort((a, b) => tierOrder[a.tier.tier] - tierOrder[b.tier.tier]
+      || a.r.model.localeCompare(b.r.model));
 
-  const deprecatedButAlive = scored.filter(
+  const deprecatedButAlive = ranked.filter(
     ({ r }) => r.spec?.deprecated && r.category === 'ACTIVE',
   );
   if (deprecatedButAlive.length > 0) {
@@ -773,24 +870,18 @@ async function main() {
     console.log('> 这也是它们不出现在 ZCode 模型列表里的原因——宁可少给，不给随时会失效的。\n');
   }
 
-  console.log(`| 模型 ID | 状态 | 上下文窗口 | 最大输出 | 推理档位 | 图像 | 工具调用 | 结构化 | 规格参考分 |`);
-  console.log(`| :--- | :--- | ---: | ---: | :--- | :---: | :---: | :---: | ---: |`);
-  for (const { r, score } of scored) {
+  console.log(`| 模型 | 状态 | 上下文 | 档位 | 社区热度（OpenRouter 日榜） |`);
+  console.log(`| :--- | :--- | ---: | :---: | :--- |`);
+  for (const { r, tier } of ranked) {
     const spec = r.spec;
-    const breakdown = specBreakdown(spec);
-    const scoreCell = score === null
-      ? '未知'
-      : `**${score}**/100<br>${SPEC_LABELS
-        .map(([key, label]) => `${label} ${breakdown[key]}/${SPEC_WEIGHTS[key]}`)
-        .join(' · ')}`;
+    const ctx = spec ? formatTokens(spec.contextWindow) : '未知';
     // 目录标了废弃的，状态后面跟一句——实测仍通只是"现在还能用"，不是长期保证。
     const statusCell = spec?.deprecated ? `${r.statusBadge} ⚠️目录已废弃` : r.statusBadge;
-    console.log(
-      `| **${r.model}** | ${statusCell} | ${spec ? formatTokens(spec.contextWindow) : '未知'} | `
-      + `${spec ? formatTokens(spec.maxOutput) : '未知'} | ${spec ? formatEfforts(spec) : '未知'} | `
-      + `${spec && spec.inputModalities.includes('image') ? '✅' : '—'} | `
-      + `${spec?.toolCall ? '✅' : '—'} | ${spec?.structuredOutput ? '✅' : '—'} | ${scoreCell} |`,
-    );
+    const tierCell = `**${tier.tier}** ${tier.label}`;
+    const heat = r.popularity
+      ? `${formatRank(r.popularity)} · ${formatCount(r.popularity.count)}`
+      : '—';
+    console.log(`| **${r.model}** | ${statusCell} | ${ctx} | ${tierCell} | ${heat} |`);
   }
   console.log();
 

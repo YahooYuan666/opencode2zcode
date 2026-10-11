@@ -496,10 +496,39 @@ node selftest.mjs                  # 22 项：Node 版自测
 只认一种会让整个元数据判定静默失效，然后所有名字带 `free` 的模型都被放行，
 下架的也混进来。对拍把两个实现放在同一组断言下跑，任何一边跑偏都会被抓到。
 
-## 致谢
+## 免责声明
 
-- [opencode2pi-desktop](https://github.com/JasonYu0822/opencode2pi-desktop)（MIT）—
-  本工具的移植来源，伪装头 / 体门禁 / 目录 S1∩S2 / SSE 透传都出自它的 `lib/zen.js`
-- [opencode2dsh](https://github.com/FishBottle7/opencode2dsh)（MIT，© FishBottle7）
-- [opencode2api](https://github.com/jasonxu114514/opencode2api)
-- [OpenCode](https://opencode.ai) — 匿名 Zen 免费通道的提供方
+- 本项目与 OpenCode、ZCode 官方**没有任何关系**，也不是官方插件。
+- 它通过模拟 OpenCode CLI 的请求特征，使用 OpenCode Zen 的**匿名免费通道**。
+  这条通道官方本意只开放给自家客户端使用——没有盗用任何账号或密钥
+  （凭据是公开的占位符 `public`），但确实是在对方设了限制的地方走了侧门。
+- 上游随时可能改规则让它失效（2026-09-16 就收紧过一次会话 id 校验）。
+  用的时候请节制，不要拿它跑大批量任务把免费通道打爆。
+- 本项目仅用于学习与个人使用，风险自负。如果你不接受这些，请直接注册
+  OpenCode 账号或使用其它正规渠道。
+
+## 配套技能与命令（可选）
+
+`skills/opencode-probe/` 里带了配套的 ZCode 技能与命令：装到
+`~/.zcode/skills/opencode-probe/SKILL.md` 和 `~/.zcode/commands/opencode-probe.md`
+之后，在 ZCode 里输入 `/opencode-probe` 就能一键体检所有免费渠道，
+输出 S/A/B/C 档位、上下文窗口与 OpenRouter 社区热度，辅助选模型。
+
+## 致谢 🫡
+
+这个项目站在好几层前人的肩膀上，每一层都实名感谢：
+
+- [**JasonYu0822/opencode2pi-desktop**](https://github.com/JasonYu0822/opencode2pi-desktop)（MIT）—
+  **本工具的直接移植来源** 🫡。伪装头、体门禁、目录 S1∩S2、SSE 透传都出自它的
+  `lib/zen.js`，没有它就没有这个项目。本项目的 Responses 线修复也已回馈为它的
+  Issue 与 PR。
+- [**FishBottle7/opencode2dsh**](https://github.com/FishBottle7/opencode2dsh)（MIT，© FishBottle7）—
+  上一层的来源：伪装头与规范会话 id 形状的出处，架构文档写得极好。
+- [**eric8bit/pi-commandcode-desktop**](https://github.com/eric8bit/pi-commandcode-desktop)（MIT）—
+  「回环端点 + 静态 provider 声明」这套架构模式的样板。
+- [**jasonxu114514/opencode2api**](https://github.com/jasonxu114514/opencode2api)（GPL-3.0）—
+  整个伪装思路的祖师爷。本项目没有复制它的代码，其开创的协议参数
+  （头名称、会话 id 形状、门禁要求）是功能事实，已由本项目自己的抓包
+  独立复验（见 `rust/tests/capture-opencode-request.mjs`）。
+- [**OpenCode**](https://opencode.ai) — 匿名 Zen 免费通道的提供方，没有这份慷慨
+  就什么都不会有。

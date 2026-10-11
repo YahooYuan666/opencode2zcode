@@ -75,7 +75,12 @@ try {
     fs.renameSync(path.join(expand, name), path.join(pkgDir, name));
   }
   const files = fs.readdirSync(pkgDir).sort();
-  step('解压得到三个文件', files.length === 3, `实际：${files.join(', ')}`);
+  step(
+    '解压得到核心三件 + tools/skills 目录',
+    files.includes('AI-SETUP.md') && files.includes('README.md') && files.includes('opencode2zcode.exe')
+      && files.includes('tools') && files.includes('skills'),
+    `实际：${files.join(', ')}`,
+  );
   step('AI-SETUP.md 在包内（AI 读它）', files.includes('AI-SETUP.md'));
   step('exe 在包内', files.includes('opencode2zcode.exe'));
   step(

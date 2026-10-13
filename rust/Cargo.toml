@@ -1,6 +1,6 @@
 [package]
 name = "opencode2zcode"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.80"
 description = "把 OpenCode Zen 的匿名免费模型接进 ZCode"

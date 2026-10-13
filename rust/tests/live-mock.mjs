@@ -171,6 +171,10 @@ try {
   check('x-opencode-client: cli', h['x-opencode-client'] === 'cli');
   check('session id 形状规范', /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(String(h['x-opencode-session'])),
     String(h['x-opencode-session']));
+  check('session id 真实倒序时钟末3位为 ffe', String(h['x-opencode-session']).slice(13, 16) === 'ffe',
+    String(h['x-opencode-session']));
+  check('request id 官方 msg_ 格式', /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(String(h['x-opencode-request'])),
+    String(h['x-opencode-request']));
   check('匿名通道用 public', h['authorization'] === 'Bearer public');
   check('强制 stream: true', received[0].body.stream === true);
 

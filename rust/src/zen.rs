@@ -5,6 +5,9 @@
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 匿名通道的固定 Bearer，不是密钥，PI-Desktop 那边也一样写死。
 pub const ANONYMOUS_KEY: &str = "public";
@@ -21,6 +24,13 @@ const FREE_LANE_GATE_TOOL_NAMES: [&str; 2] = ["bash", "read"];
 /// 上游确实会接受的「主动思考」档位。off/none 不在其中，见 effort 模块注释。
 pub const ACCEPTED_EFFORT_LADDER: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
 pub const DEFAULT_EFFORT_LADDER: [&str; 4] = ["minimal", "low", "medium", "high"];
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 fn base62_fixed(mut value: u128, width: usize) -> String {
     let base: u128 = 62;
@@ -64,15 +74,25 @@ fn conversation_seed(messages: &[Value]) -> String {
     String::new()
 }
 
-/// 免费通道只认 ses_+12hex+14base62 的形状，别的都确定性哈希进去。
-fn canonical_session_id(signal: &str) -> String {
-    if is_canonical_session(signal) {
-        return signal.to_string();
+/// 官方客户端 Identifier.descending() 生成的时间戳前缀：
+/// ~(Date.now() * 0x1000 + 1) 截断到 48 位取 12 位十六进制，由于末位 counter=1，
+/// 低 12 位取反后必然以 "ffe" 结尾。
+pub fn inverted_timestamp_hex(now: u64) -> String {
+    let current = (now as u128) * 0x1000 + 1;
+    let inverted = (!current) & 0xFFFFFFFFFFFF;
+    format!("{inverted:012x}")
+}
+
+/// 检查 session 前缀是否是合法的官方降序时间戳（2026-10-13 上游新增时间校验）
+fn is_descending_time_part(time_part: &str) -> bool {
+    if time_part.len() != 12 {
+        return false;
     }
-    let hex = sha256_hex(&format!("ses\0{signal}"));
-    let time_part = hex_slice(&hex, 0, 12);
-    let tail = u128::from_str_radix(hex_slice(&hex, 12, 32), 16).unwrap_or(0);
-    format!("ses_{time_part}{}", base62_fixed(tail, 14))
+    // 官方接受 counter 1-63，也就是以 f[c-f][0-9a-f] 结尾
+    let bytes = time_part.as_bytes();
+    bytes.iter().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && bytes[9] == b'f'
+        && (b'c'..=b'f').contains(&bytes[10])
 }
 
 fn is_canonical_session(value: &str) -> bool {
@@ -83,8 +103,48 @@ fn is_canonical_session(value: &str) -> bool {
         return false;
     }
     let (head, tail) = rest.split_at(12);
-    head.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        && tail.chars().all(|c| c.is_ascii_alphanumeric())
+    is_descending_time_part(head) && tail.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+const SESSION_MEMO_LIMIT: usize = 1024;
+static SESSION_MEMO: Mutex<Option<VecDeque<(String, String)>>> = Mutex::new(None);
+
+/// 免费通道要求真实的倒序时钟时间戳（2026-10-13 上游收紧）。
+/// 为了防止多轮对话或重试因毫秒漂移丢失会话缓存和配额亲和，
+/// 按会话种子 signal 进行 memo 缓存（上限 1024）。
+fn canonical_session_id(signal: &str) -> String {
+    if is_canonical_session(signal) {
+        return signal.to_string();
+    }
+
+    let mut lock = SESSION_MEMO.lock().unwrap();
+    let memo = lock.get_or_insert_with(VecDeque::new);
+
+    for (k, v) in memo.iter() {
+        if k == signal {
+            return v.clone();
+        }
+    }
+
+    let sum = sha256_hex(&format!("ses\0{signal}"));
+    let time_part = inverted_timestamp_hex(now_millis());
+    let tail = u128::from_str_radix(hex_slice(&sum, 12, 32), 16).unwrap_or(0);
+    let session = format!("ses_{time_part}{}", base62_fixed(tail, 14));
+
+    if memo.len() >= SESSION_MEMO_LIMIT {
+        memo.pop_front();
+    }
+    memo.push_back((signal.to_string(), session.clone()));
+
+    session
+}
+
+/// 官方客户端格式的 request ID：`msg_` + 递增正序时间戳(12位hex) + 14位Base62随机串
+fn mint_canonical_request_id() -> String {
+    let current = (now_millis() as u128) * 0x1000 + 1;
+    let time_part = format!("{:012x}", current & 0xFFFFFFFFFFFF);
+    let rand_val = u128::from_str_radix(&random_hex()[..30], 16).unwrap_or(0);
+    format!("msg_{time_part}{}", base62_fixed(rand_val, 14))
 }
 
 pub struct RequestIds {
@@ -100,7 +160,7 @@ fn derive_request_ids(messages: &[Value]) -> RequestIds {
     }
     RequestIds {
         session: canonical_session_id(&signal),
-        request: format!("req_{}", hex_slice(&sha256_hex(&random_hex()), 0, 32)),
+        request: mint_canonical_request_id(),
         project: stable_id("prj", "opencode2zcode:default-project"),
     }
 }
@@ -356,6 +416,15 @@ mod tests {
         let b = derive_request_ids(&messages);
         assert_eq!(a.session, b.session, "同一对话应恒定");
         assert!(is_canonical_session(&a.session), "形状应为 ses_+12hex+14base62，实际 {}", a.session);
+        assert_eq!(&a.session[13..16], "ffe", "真实倒序时钟末3位必须为 ffe");
+        assert!(a.request.starts_with("msg_"), "请求ID格式必须为 msg_，实际 {}", a.request);
+    }
+
+    #[test]
+    fn 真实倒序时钟算法对齐官方() {
+        let hex = inverted_timestamp_hex(1_791_895_680_000);
+        assert_eq!(&hex[9..12], "ffe", "counter=1 时取反末3位必须是 ffe");
+        assert!(is_descending_time_part(&hex));
     }
 
     #[test]

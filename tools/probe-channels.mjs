@@ -598,13 +598,56 @@ function classifyError(status, text) {
 
 /// 上游直连地址与伪装头。systemone 这条道本工具没有代理，只能直连探测。
 const UPSTREAM_BASE = 'https://opencode.ai/zen';
-const UPSTREAM_HEADERS = {
-  authorization: 'Bearer public',
-  'user-agent': 'opencode/latest/2.0.21/cli',
-  'x-opencode-client': 'cli',
-  'x-opencode-session': 'ses_f07de6fa9ffe753Eu4qlyXU0sC',
-  accept: 'application/json',
-};
+
+const PROBE_BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+function probeBase62Fixed(value, width) {
+  let n = BigInt(value);
+  const base = 62n;
+  const out = new Array(width);
+  for (let i = width - 1; i >= 0; i--) {
+    out[i] = PROBE_BASE62.charAt(Number(n % base));
+    n /= base;
+  }
+  return out.join('');
+}
+
+function probeMintSession(now = Date.now()) {
+  const current = BigInt(now) * 0x1000n + 1n;
+  const inverted = (~current) & 0xffffffffffffn;
+  const timePart = inverted.toString(16).padStart(12, '0');
+  const sum = importHash('probe-zen-session');
+  return `ses_${timePart}${sum}`;
+}
+
+function importHash(signal) {
+  const crypto = globalThis.crypto;
+  const bytes = new Uint8Array(10);
+  crypto.getRandomValues(bytes);
+  let hex = '';
+  for (const b of bytes) hex += b.toString(16).padStart(2, '0');
+  return probeBase62Fixed(BigInt('0x' + hex), 14);
+}
+
+function probeMintRequest(now = Date.now()) {
+  const current = BigInt(now) * 0x1000n + 1n;
+  const timePart = (current & 0xffffffffffffn).toString(16).padStart(12, '0');
+  return `msg_${timePart}${importHash('req')}`;
+}
+
+function getUpstreamDirectHeaders() {
+  const session = probeMintSession();
+  return {
+    authorization: 'Bearer public',
+    'user-agent': 'opencode/1.18.31 (win32 x64; node20)',
+    'x-opencode-client': 'cli',
+    'x-opencode-session': session,
+    'x-session-affinity': session,
+    'x-session-id': session,
+    'x-opencode-request': probeMintRequest(),
+    'x-opencode-project': 'prj_0123456789abcdef01234567',
+    accept: 'application/json',
+  };
+}
 
 // 测试单个模型（单次请求）
 async function probeOnce(port, modelInfo, timeoutMs) {
@@ -624,10 +667,11 @@ async function probeOnce(port, modelInfo, timeoutMs) {
 
   const startTime = Date.now();
   try {
+    const directHeaders = isSystemone ? getUpstreamDirectHeaders() : null;
     let res = await fetch(url, {
       method: 'POST',
       headers: isSystemone
-        ? { ...UPSTREAM_HEADERS, 'content-type': 'application/json' }
+        ? { ...directHeaders, 'content-type': 'application/json' }
         : { 'content-type': 'application/json' },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
@@ -640,7 +684,7 @@ async function probeOnce(port, modelInfo, timeoutMs) {
       const stripped = { ...body, model: modelInfo.id.slice(0, -'-free'.length) };
       res = await fetch(url, {
         method: 'POST',
-        headers: { ...UPSTREAM_HEADERS, 'content-type': 'application/json' },
+        headers: { ...directHeaders, 'content-type': 'application/json' },
         body: JSON.stringify(stripped),
         signal: AbortSignal.timeout(timeoutMs),
       });

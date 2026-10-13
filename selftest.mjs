@@ -257,6 +257,8 @@ async function main() {
         assert.match(String(h['user-agent']), /^opencode\//, 'user-agent 应自称 opencode CLI');
         assert.equal(h['x-opencode-client'], 'cli', '应有 x-opencode-client: cli');
         assert.match(String(h['x-opencode-session']), /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/, 'session id 形状应规范');
+        assert.equal(String(h['x-opencode-session']).slice(13, 16), 'ffe', 'session id 真实倒序时钟末3位必须为 ffe');
+        assert.match(String(h['x-opencode-request']), /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/, 'request id 应为 msg_ 官方格式');
         assert.equal(h['authorization'], 'Bearer public', '匿名通道用 public 占位');
       });
 

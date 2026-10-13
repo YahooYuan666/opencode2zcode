@@ -103,6 +103,7 @@ const CACHE_FILE_NAME = 'opencode2zcode-catalog.json';
 // ---------------------------------------------------------------------------
 
 const CANONICAL_SESSION_PATTERN = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+const DESCENDING_TIME_PART_PATTERN = /^[0-9a-f]{9}f[c-f][0-9a-f]$/;
 const BASE62_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
 function base62Fixed(value, width) {
@@ -136,13 +137,55 @@ function conversationSeed(messages) {
   return '';
 }
 
-/** 免费通道只认 ses_+12hex+14base62 的形状，别的都确定性哈希进去。 */
+/**
+ * 官方客户端 Identifier.descending() 生成的时间戳前缀：
+ * ~(Date.now() * 0x1000 + 1) 截断到 48 位取 12 位十六进制，由于末位 counter=1，
+ * 低 12 位取反后必然以 "ffe" 结尾。2026-10-13 起上游解密该段做时间戳有效性校验。
+ */
+function invertedTimestampHex(now = Date.now()) {
+  const current = BigInt(now) * 0x1000n + 1n;
+  const inverted = ~current & 0xffffffffffffn;
+  return inverted.toString(16).padStart(12, '0');
+}
+
+const SESSION_MEMO_LIMIT = 1024;
+const sessionMemo = new Map();
+
+/**
+ * 免费通道要求真实的倒序时钟时间戳（2026-10-13 上游收紧）。
+ * 为保证多轮对话与重试不会因毫秒推进丢失 prompt cache 亲和与配额状态，
+ * 按会话信号 signal 进行 memo 缓存（上限 1024 条先进先出）。
+ */
 function canonicalSessionID(signal) {
-  if (CANONICAL_SESSION_PATTERN.test(signal)) return signal;
+  if (CANONICAL_SESSION_PATTERN.test(signal)) {
+    const timePart = signal.slice(4, 16);
+    if (DESCENDING_TIME_PART_PATTERN.test(timePart)) return signal;
+  }
+
+  const memoized = sessionMemo.get(signal);
+  if (memoized !== undefined) return memoized;
+
   const sum = createHash('sha256').update(`ses\x00${signal}`).digest();
-  const timePart = sum.subarray(0, 6).toString('hex');
+  const timePart = invertedTimestampHex();
   const randomPart = base62Fixed(BigInt(`0x${sum.subarray(6, 16).toString('hex')}`), 14);
-  return `ses_${timePart}${randomPart}`;
+  const session = `ses_${timePart}${randomPart}`;
+
+  if (sessionMemo.size >= SESSION_MEMO_LIMIT) {
+    const oldest = sessionMemo.keys().next();
+    if (!oldest.done) sessionMemo.delete(oldest.value);
+  }
+  sessionMemo.set(signal, session);
+  return session;
+}
+
+/**
+ * 官方客户端格式的 request ID：`msg_` + 递增正序时间戳(12位hex) + 14位Base62随机串
+ */
+function mintCanonicalRequestID() {
+  const current = BigInt(Date.now()) * 0x1000n + 1n;
+  const timePart = (current & 0xffffffffffffn).toString(16).padStart(12, '0');
+  const randomPart = base62Fixed(BigInt(`0x${randomBytes(10).toString('hex')}`), 14);
+  return `msg_${timePart}${randomPart}`;
 }
 
 function deriveRequestIDs(messages) {
@@ -150,7 +193,7 @@ function deriveRequestIDs(messages) {
   if (signal === '' || signal === '{}') signal = randomID('fallback', 16);
   return {
     session: canonicalSessionID(signal),
-    request: randomID('req', 16),
+    request: mintCanonicalRequestID(),
     project: stableID('prj', 'opencode2zcode:default-project'),
   };
 }
